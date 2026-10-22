@@ -1,0 +1,1174 @@
+#!/usr/bin/env python3
+"""rsa-server: task queue, worker and admin CLI for remote OpenCode sandboxes.
+
+Installed on the Linux host as ~/.rsa/app/rsa-server and driven over SSH by the `rsa`
+client. Machine-facing commands print one JSON document on stdout; failures print
+{"ok": false, "error": "..."} and exit with status 2. Python standard library only.
+
+State lives in RSA_HOME (default ~/.rsa):
+  app/                   installed code (this file, sandbox/, rsa-worker.service)
+  config.json            overrides for DEFAULTS below
+  secrets/opencode.env   provider API keys handed to sandboxes (KEY=value lines)
+  repos/<repo>.git       bare repos; refs/rsa/base/<id> in, refs/rsa/result/<id> out
+  queue/<id>             pending tasks, FIFO by id; a worker claims one by unlinking it
+  tasks/<id>/            in/ (prompt + spec), out/ (sandbox output), status.json, task.log
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "1.0.0"
+RSA_HOME = Path(os.environ.get("RSA_HOME") or Path.home() / ".rsa")
+APP = RSA_HOME / "app"
+REPOS = RSA_HOME / "repos"
+TASKS = RSA_HOME / "tasks"
+QUEUE = RSA_HOME / "queue"
+SECRETS = RSA_HOME / "secrets"
+ENV_FILE = SECRETS / "opencode.env"
+CONFIG_FILE = RSA_HOME / "config.json"
+UNIT_NAME = "rsa-worker.service"
+
+DEFAULTS = {
+    "docker_host": f"unix:///run/user/{os.getuid()}/docker.sock",
+    "require_rootless": True,
+    "image": "rsa-sandbox:latest",
+    "opencode_version": "2.1.3",
+    "default_model": "opencode/big-pickle",
+    "timeout_minutes": 60,
+    "cpus": "3",
+    "memory": "6g",
+    "pids_limit": 2048,
+    "dns": ["1.1.1.1", "9.9.9.9"],
+    "block_private_network": True,
+    "workers": 1,
+    "max_attempts": 2,
+    "retention_days": 14,
+    "max_bundle_mb": 200,
+    "git_name": "rsa-agent",
+    "git_email": "rsa-agent@localhost",
+    "data_volume": "rsa-opencode-data",
+}
+
+TERMINAL = {"succeeded", "failed", "cancelled"}
+ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")
+REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+MODEL_RE = re.compile(r"^[A-Za-z0-9._:/@#+-]{1,200}$")
+AGENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+STOP_GRACE_SEC = 120  # host-side slack on top of the in-sandbox timeout
+
+
+class RsaError(Exception):
+    pass
+
+
+# ------------------------------------------------------------------ helpers
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+def new_id():
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
+
+
+def id_time(tid):
+    return datetime.strptime(tid[:15], "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc).timestamp()
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, indent=2) + "\n")
+    sys.stdout.flush()
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def write_json(path, data):
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    cfg.update(read_json(CONFIG_FILE, {}) or {})
+    return cfg
+
+
+def check_id(tid):
+    if not ID_RE.match(tid or ""):
+        raise RsaError(f"invalid task id: {tid!r}")
+    return tid
+
+
+def check_repo(name):
+    if not REPO_RE.match(name or "") or ".." in name:
+        raise RsaError(f"invalid repo name: {name!r}")
+    return name
+
+
+def repo_path(name):
+    return REPOS / f"{check_repo(name)}.git"
+
+
+def task_dir(tid):
+    return TASKS / check_id(tid)
+
+
+def tlog(tid, msg):
+    line = f"[{now_iso()}] {msg}"
+    try:
+        with open(TASKS / tid / "task.log", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except FileNotFoundError:
+        pass
+    if os.environ.get("RSA_WORKER"):
+        print(f"{tid}: {msg}", flush=True)
+
+
+def run(cmd, check=True, env=None, input=None, timeout=None):
+    p = subprocess.run(cmd, capture_output=True, text=True, env=env, input=input, timeout=timeout)
+    if check and p.returncode != 0:
+        raise RsaError(f"{' '.join(cmd[:4])} failed: {(p.stderr or p.stdout).strip()[-800:]}")
+    return p
+
+
+def git(repo, *args, check=True):
+    return run(["git", "-C", str(repo), *args], check=check)
+
+
+def docker_env(cfg=None):
+    env = dict(os.environ)
+    env["DOCKER_HOST"] = (cfg or load_config())["docker_host"]
+    env.pop("DOCKER_CONTEXT", None)
+    return env
+
+
+def docker(*args, check=True, cfg=None, timeout=None):
+    return run(["docker", *args], check=check, env=docker_env(cfg), timeout=timeout)
+
+
+def systemctl(*args, check=False):
+    return run(["systemctl", "--user", *args], check=check)
+
+
+def sandbox_hash(cfg):
+    h = hashlib.sha256(cfg["opencode_version"].encode())
+    for f in sorted((APP / "sandbox").iterdir()):
+        if f.is_file():
+            h.update(f.name.encode() + b"\0" + f.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def image_hash(cfg):
+    p = docker("image", "inspect", "--format", '{{index .Config.Labels "rsa.sandbox_hash"}}',
+               cfg["image"], check=False, cfg=cfg)
+    return p.stdout.strip() if p.returncode == 0 else None
+
+
+def docker_is_rootless(cfg):
+    p = docker("info", "--format", "{{json .SecurityOptions}}", check=False, cfg=cfg, timeout=30)
+    if p.returncode != 0:
+        raise RsaError(f"docker daemon unreachable at {cfg['docker_host']}: {p.stderr.strip()[-300:]}")
+    return "rootless" in p.stdout
+
+
+# ------------------------------------------------------------------ task state
+
+def task_info(tid, with_queue=True):
+    d = TASKS / tid
+    spec = read_json(d / "in" / "task.json")
+    st = read_json(d / "status.json")
+    if spec is None or st is None:
+        return None
+    info = {**spec, **st}
+    if with_queue and info["state"] == "queued":
+        queued = sorted(os.listdir(QUEUE))
+        info["queue_position"] = queued.index(tid) + 1 if tid in queued else None
+    return info
+
+
+def require_task(tid):
+    info = task_info(check_id(tid))
+    if info is None:
+        raise RsaError(f"no such task: {tid}")
+    return info
+
+
+def set_status(tid, **changes):
+    path = TASKS / tid / "status.json"
+    st = read_json(path, {})
+    st.update(changes)
+    write_json(path, st)
+    return st
+
+
+def enqueue(tid):
+    (QUEUE / tid).touch()
+
+
+def create_task(spec, prompt, cfg):
+    tid = spec["id"]
+    d = TASKS / tid
+    try:
+        d.mkdir(parents=True)
+    except FileExistsError:
+        raise RsaError(f"task {tid} already exists")
+    (d / "in").mkdir()
+    (d / "in" / "prompt.md").write_text(prompt, encoding="utf-8")
+    write_json(d / "in" / "task.json", spec)
+    write_json(d / "status.json", {"state": "queued", "created_at": now_iso(), "attempts": 0})
+    enqueue(tid)
+    tlog(tid, f"queued: repo {spec['repo']}, base {spec['base'][:12]}, model {spec['model']}")
+    return tid
+
+
+def worker_state():
+    return systemctl("is-active", UNIT_NAME).stdout.strip() or "unknown"
+
+
+# ------------------------------------------------------------------ commands: tasks
+
+def cmd_ensure_repo(a):
+    repo = repo_path(a.repo)
+    if not (repo / "HEAD").exists():
+        REPOS.mkdir(parents=True, exist_ok=True)
+        run(["git", "init", "-q", "--bare", str(repo)])
+        git(repo, "config", "core.logAllRefUpdates", "false")
+        git(repo, "config", "gc.auto", "1000")
+    emit({"repo": a.repo, "path": str(repo)})
+
+
+def cmd_submit(a):
+    cfg = load_config()
+    req = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    tid = check_id(req.get("id") or new_id())
+    repo_name = check_repo(req.get("repo", ""))
+    repo = repo_path(repo_name)
+    base = str(req.get("base", "")).lower()
+    if not SHA_RE.match(base):
+        raise RsaError("base must be a full 40-character commit sha")
+    prompt = str(req.get("prompt") or "").strip()
+    if not prompt:
+        raise RsaError("prompt is empty")
+    if len(prompt.encode()) > 100_000:  # passed as one argv string; Linux caps those at 128 KB
+        raise RsaError("prompt is larger than 100 KB; put long context in the repository instead")
+    model = str(req.get("model") or cfg["default_model"])
+    if not MODEL_RE.match(model):
+        raise RsaError(f"invalid model name: {model!r}")
+    agent = str(req.get("agent") or "")
+    if agent and not AGENT_RE.match(agent):
+        raise RsaError(f"invalid agent name: {agent!r}")
+    timeout = int(req.get("timeout_minutes") or cfg["timeout_minutes"])
+    if not 1 <= timeout <= 24 * 60:
+        raise RsaError("timeout_minutes must be between 1 and 1440")
+    if not (repo / "HEAD").exists():
+        raise RsaError(f"unknown repo {repo_name}; run ensure-repo and push first")
+    have = git(repo, "rev-parse", "-q", "--verify", f"refs/rsa/base/{tid}^{{commit}}", check=False).stdout.strip()
+    if have != base:
+        if git(repo, "cat-file", "-e", f"{base}^{{commit}}", check=False).returncode != 0:
+            raise RsaError(f"base commit {base[:12]} is not on the server; push it first")
+        git(repo, "update-ref", f"refs/rsa/base/{tid}", base)
+    source = req.get("source") if isinstance(req.get("source"), dict) else {}
+    spec = {
+        "id": tid, "repo": repo_name, "base": base, "model": model, "agent": agent,
+        "timeout_minutes": timeout,
+        "title": str(req.get("title") or prompt.splitlines()[0])[:120],
+        "source": {str(k)[:40]: str(v)[:300] for k, v in list(source.items())[:10]},
+    }
+    create_task(spec, prompt, cfg)
+    info = task_info(tid)
+    emit({"id": tid, "state": "queued", "queue_position": info.get("queue_position"),
+          "worker": worker_state()})
+
+
+def cmd_status(a):
+    info = require_task(a.id)
+    prompt = (TASKS / a.id / "in" / "prompt.md").read_text(encoding="utf-8")
+    info["prompt"] = prompt if a.prompt else prompt[:300]
+    emit(info)
+
+
+def cmd_list(a):
+    items = []
+    if TASKS.exists():
+        for tid in sorted(os.listdir(TASKS), reverse=True):
+            if not ID_RE.match(tid):
+                continue
+            info = task_info(tid)
+            if info is None or (a.repo and info["repo"] != a.repo):
+                continue
+            if a.active and info["state"] in TERMINAL:
+                continue
+            info.pop("summary", None)
+            info.pop("files", None)
+            items.append(info)
+            if len(items) >= a.limit:
+                break
+    emit({"tasks": items, "worker": worker_state()})
+
+
+def cmd_wait(a):
+    deadline = time.time() + max(0, a.timeout)
+    while True:
+        info = require_task(a.id)
+        if info["state"] in TERMINAL or time.time() >= deadline:
+            info["done"] = info["state"] in TERMINAL
+            emit(info)
+            return
+        time.sleep(min(3, max(0.5, deadline - time.time())))
+
+
+def cmd_cancel(a):
+    cfg = load_config()
+    info = require_task(a.id)
+    if info["state"] in TERMINAL:
+        emit({**info, "note": f"task already {info['state']}"})
+        return
+    try:
+        (QUEUE / a.id).unlink()
+        set_status(a.id, state="cancelled", finished_at=now_iso(), error="cancelled before start")
+        tlog(a.id, "cancelled while queued")
+    except FileNotFoundError:
+        (TASKS / a.id / "cancel").touch()
+        tlog(a.id, "cancel requested")
+        docker("kill", f"rsa-{a.id}", check=False, cfg=cfg)
+        deadline = time.time() + 20
+        while time.time() < deadline and require_task(a.id)["state"] not in TERMINAL:
+            time.sleep(1)
+    emit(require_task(a.id))
+
+
+def cmd_retry(a):
+    cfg = load_config()
+    old = require_task(a.id)
+    if old["state"] not in TERMINAL:
+        raise RsaError(f"task {a.id} is still {old['state']}")
+    tid = new_id()
+    git(repo_path(old["repo"]), "update-ref", f"refs/rsa/base/{tid}", old["base"])
+    spec = {k: old[k] for k in ("repo", "base", "model", "agent", "timeout_minutes", "title", "source")}
+    spec.update(id=tid, retry_of=a.id)
+    if a.model:
+        if not MODEL_RE.match(a.model):
+            raise RsaError(f"invalid model name: {a.model!r}")
+        spec["model"] = a.model
+    prompt = (TASKS / a.id / "in" / "prompt.md").read_text(encoding="utf-8")
+    create_task(spec, prompt, cfg)
+    info = task_info(tid)
+    emit({"id": tid, "retry_of": a.id, "state": "queued",
+          "queue_position": info.get("queue_position"), "worker": worker_state()})
+
+
+# ------------------------------------------------------------------ logs
+
+def short(value, n=160):
+    s = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def render_event(ev):
+    t = ev.get("timestamp")
+    ts = datetime.fromtimestamp(t / 1000).strftime("%H:%M:%S") if isinstance(t, (int, float)) else "--:--:--"
+    kind, part = ev.get("type"), ev.get("part") or {}
+    if kind == "tool_use":
+        state = part.get("state") or {}
+        inp = state.get("input") or {}
+        tool = part.get("tool", "?")
+        arg = inp.get("command") or inp.get("path") or inp.get("filePath") or inp.get("pattern") or inp
+        mark = "" if state.get("status") == "completed" else f" [{state.get('status')}]"
+        return f"{ts} {tool}{mark}: {short(arg)}"
+    if kind == "text":
+        text = (part.get("text") or "").strip()
+        return f"{ts} assistant:\n    " + "\n    ".join(text.splitlines()) if text else None
+    if kind == "error":
+        err = ev.get("error") or {}
+        return f"{ts} ERROR {err.get('type', '')}: {err.get('message', err)}"
+    return None
+
+
+def iter_events(path, start=0):
+    """Yield (event, next_offset) for complete JSON lines from byte offset `start`."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            pos = start
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    break
+                pos += len(raw)
+                try:
+                    yield json.loads(raw), pos
+                except json.JSONDecodeError:
+                    yield None, pos
+    except FileNotFoundError:
+        return
+
+
+def summarize_events(path):
+    texts, last_msg, errors = {}, None, []
+    tokens = {"input": 0, "output": 0}
+    cost, tools = 0.0, 0
+    for ev, _ in iter_events(path):
+        if not ev:
+            continue
+        part = ev.get("part") or {}
+        if ev.get("type") == "text" and part.get("text"):
+            mid = part.get("messageID")
+            texts.setdefault(mid, []).append(part["text"])
+            last_msg = mid
+        elif ev.get("type") == "tool_use":
+            tools += 1
+        elif ev.get("type") == "step_finish":
+            tk = part.get("tokens") or {}
+            tokens["input"] += int(tk.get("input") or 0)
+            tokens["output"] += int(tk.get("output") or 0)
+            cost += float(part.get("cost") or 0)
+        elif ev.get("type") == "error":
+            err = ev.get("error") or {}
+            errors.append(str(err.get("message") or err)[:500])
+    summary = "\n".join(texts.get(last_msg, [])).strip()
+    return {"summary": summary[:8000], "tokens": tokens, "cost": round(cost, 4),
+            "tool_calls": tools, "errors": errors[-5:]}
+
+
+def cmd_logs(a):
+    info = require_task(a.id)
+    d = TASKS / a.id
+    if a.raw or a.sandbox:
+        path = d / "out" / ("events.jsonl" if a.raw else "sandbox.log")
+        offset = 0
+        while True:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read()
+                    offset += len(chunk)
+                    sys.stdout.write(chunk.decode("utf-8", "replace"))
+                    sys.stdout.flush()
+            except FileNotFoundError:
+                pass
+            if not a.follow or require_task(a.id)["state"] in TERMINAL:
+                return
+            time.sleep(2)
+    lines = (d / "task.log").read_text(encoding="utf-8").splitlines() if (d / "task.log").exists() else []
+    events = d / "out" / "events.jsonl"
+    rendered, offset = [], 0
+    for ev, offset in iter_events(events):
+        line = ev and render_event(ev)
+        if line:
+            rendered.append(line)
+    out = lines + rendered
+    if a.tail:
+        out = out[-a.tail:]
+    print("\n".join(out), flush=True)
+    if not a.follow:
+        return
+    seen_log = len(lines)
+    while True:
+        done = require_task(a.id)["state"] in TERMINAL
+        for ev, offset in iter_events(events, offset):
+            line = ev and render_event(ev)
+            if line:
+                print(line, flush=True)
+        cur = (d / "task.log").read_text(encoding="utf-8").splitlines() if (d / "task.log").exists() else []
+        for line in cur[seen_log:]:
+            print(line, flush=True)
+        seen_log = len(cur)
+        if done:
+            return
+        time.sleep(2)
+
+
+# ------------------------------------------------------------------ worker
+
+class Worker:
+    def __init__(self):
+        self.cfg = load_config()
+        self.stop = threading.Event()
+        self.lock = threading.Lock()
+        self.adopted = []  # running tasks found at startup whose containers are still alive
+
+    # -- startup recovery
+    def recover(self):
+        live = {}
+        p = docker("ps", "-a", "--filter", "label=rsa.task", "--format",
+                   '{{.Names}} {{.State}} {{.Label "rsa.task"}}', check=False, cfg=self.cfg)
+        for line in p.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 3:
+                live[parts[2]] = parts[1]
+        for tid in sorted(os.listdir(TASKS)) if TASKS.exists() else []:
+            if not ID_RE.match(tid):
+                continue
+            st = read_json(TASKS / tid / "status.json", {})
+            state = st.get("state")
+            if state == "running":
+                if tid in live:
+                    tlog(tid, "worker restarted; re-attaching to the running sandbox")
+                    self.adopted.append(tid)
+                else:
+                    self.requeue_or_fail(tid, "sandbox container disappeared (host or docker restart)")
+            elif state == "queued" and not (QUEUE / tid).exists():
+                enqueue(tid)
+        for tid in live:
+            if tid not in self.adopted:
+                docker("rm", "-f", f"rsa-{tid}", check=False, cfg=self.cfg)
+
+    def requeue_or_fail(self, tid, reason, count_attempt=True):
+        st = read_json(TASKS / tid / "status.json", {})
+        attempts = st.get("attempts", 0) - (0 if count_attempt else 1)
+        if attempts < int(self.cfg["max_attempts"]) and not (TASKS / tid / "cancel").exists():
+            set_status(tid, state="queued", attempts=max(0, attempts), last_error=reason)
+            enqueue(tid)
+            tlog(tid, f"requeued: {reason}")
+        else:
+            set_status(tid, state="failed", finished_at=now_iso(), error=reason)
+            tlog(tid, f"failed: {reason}")
+
+    def claim(self):
+        with self.lock:
+            if self.adopted:
+                return self.adopted.pop(0), True
+        for tid in sorted(os.listdir(QUEUE)):
+            try:
+                (QUEUE / tid).unlink()
+            except FileNotFoundError:
+                continue
+            if ID_RE.match(tid) and (TASKS / tid).exists():
+                return tid, False
+        return None, False
+
+    def loop(self):
+        docker_down_logged = False
+        while not self.stop.is_set():
+            if not self.adopted and not os.listdir(QUEUE):
+                self.stop.wait(2)  # idle: no docker calls, just a directory listing
+                continue
+            try:
+                docker("version", "--format", "{{.Server.Version}}", cfg=self.cfg, timeout=30)
+                docker_down_logged = False
+            except (RsaError, subprocess.TimeoutExpired) as e:
+                if not docker_down_logged:
+                    print(f"docker unavailable, holding the queue: {e}", flush=True)
+                    docker_down_logged = True
+                self.stop.wait(30)
+                continue
+            tid, adopted = self.claim()
+            if not tid:
+                self.stop.wait(2)
+                continue
+            try:
+                self.run_task(tid, adopted)
+            except Exception as e:  # never let one task kill the worker
+                tlog(tid, f"worker error: {e!r}")
+                docker("rm", "-f", f"rsa-{tid}", check=False, cfg=self.cfg)
+                self.requeue_or_fail(tid, f"worker error: {e}")
+
+    # -- one task
+    def run_task(self, tid, adopted):
+        cfg = self.cfg = load_config()
+        d = TASKS / tid
+        spec = read_json(d / "in" / "task.json")
+        name = f"rsa-{tid}"
+        if not adopted:
+            st = read_json(d / "status.json", {})
+            if st.get("state") != "queued":
+                return
+            if (d / "cancel").exists():
+                set_status(tid, state="cancelled", finished_at=now_iso(), error="cancelled before start")
+                tlog(tid, "cancelled before start")
+                return
+            attempt = st.get("attempts", 0) + 1
+            set_status(tid, state="running", started_at=now_iso(), attempts=attempt, error=None)
+            tlog(tid, f"attempt {attempt}: starting sandbox {name}")
+            if (d / "out").exists():
+                shutil.rmtree(d / "out.prev", ignore_errors=True)
+                os.replace(d / "out", d / "out.prev")
+            (d / "out").mkdir()
+            try:
+                self.ensure_image(tid)
+                docker("rm", "-f", name, check=False, cfg=cfg)
+                docker(*self.run_args(tid, spec), cfg=cfg, timeout=120)
+            except (RsaError, subprocess.TimeoutExpired) as e:
+                docker("rm", "-f", name, check=False, cfg=cfg)
+                self.requeue_or_fail(tid, f"could not start sandbox: {e}")
+                return
+
+        started = parse_iso(read_json(d / "status.json", {})["started_at"])
+        deadline = started + int(spec["timeout_minutes"]) * 60 + STOP_GRACE_SEC
+        waiter, reason = None, None
+        while True:
+            if self.stop.is_set():
+                if waiter:
+                    waiter.kill()
+                tlog(tid, "worker stopping; sandbox left running and will be re-attached")
+                return
+            if waiter is None or waiter.poll() is not None:
+                # `docker wait` returning is only a hint (it can be killed or lose the daemon);
+                # the container's own state decides whether the task is over.
+                if waiter is not None and not self.container_running(name):
+                    break
+                waiter = subprocess.Popen(["docker", "wait", name], stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL, env=docker_env(cfg))
+            if (d / "cancel").exists():
+                reason = "cancelled"
+            elif time.time() > deadline:
+                reason = "timeout"
+            if reason:
+                docker("kill", name, check=False, cfg=cfg)
+                try:
+                    waiter.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    waiter.kill()
+                break
+            time.sleep(2)
+        if reason is None and (d / "cancel").exists():  # `rsa cancel` kills the container itself
+            reason = "cancelled"
+        self.finish(tid, spec, reason)
+
+    def container_running(self, name):
+        p = docker("inspect", "--format", "{{.State.Running}}", name, check=False, cfg=self.cfg)
+        return p.returncode == 0 and p.stdout.strip() == "true"
+
+    def finish(self, tid, spec, reason):
+        cfg, d, name = self.cfg, TASKS / tid, f"rsa-{tid}"
+        p = docker("inspect", "--format", "{{.State.ExitCode}} {{.State.OOMKilled}}", name, check=False, cfg=cfg)
+        exit_code, oom = None, False
+        if p.returncode == 0:
+            code, oom_s = p.stdout.split()
+            exit_code, oom = int(code), oom_s == "true"
+            logs = docker("logs", "--tail", "200", name, check=False, cfg=cfg)
+            if (logs.stdout + logs.stderr).strip():
+                (d / "out" / "docker.log").write_text(logs.stdout + logs.stderr, encoding="utf-8")
+        docker("rm", "-f", name, check=False, cfg=cfg)
+
+        result = read_json(d / "out" / "result.json", {}) or {}
+        ev = summarize_events(d / "out" / "events.jsonl")
+        changes = {"finished_at": now_iso(), "exit_code": exit_code, "oom_killed": oom,
+                   "summary": ev["summary"], "tokens": ev["tokens"], "cost": ev["cost"],
+                   "tool_calls": ev["tool_calls"], "timed_out": bool(result.get("timed_out")) or reason == "timeout",
+                   "warnings": []}
+
+        if reason == "cancelled":
+            set_status(tid, state="cancelled", error="cancelled while running", **changes)
+            tlog(tid, "cancelled while running")
+            return
+        if exit_code in (125, 126, 127) or (exit_code == 70 and not result):
+            self.requeue_or_fail(tid, f"sandbox failed to start (exit {exit_code})")
+            return
+        if exit_code is None and not result and reason is None:
+            self.requeue_or_fail(tid, "sandbox container vanished (docker restart?)")
+            return
+
+        harvest_error = None
+        try:
+            changes.update(self.harvest(tid, spec))
+        except RsaError as e:
+            harvest_error = f"could not import the result: {e}"
+
+        error = None
+        if harvest_error:
+            error = harvest_error
+        elif reason == "timeout":
+            error = f"killed by the host after exceeding {spec['timeout_minutes']} minutes"
+        elif oom:
+            error = f"sandbox ran out of memory (limit {cfg['memory']})"
+        elif not result:
+            error = f"sandbox exited with code {exit_code} without a result"
+        elif result.get("error"):
+            error = result["error"]
+        elif result.get("timed_out"):
+            error = f"agent timed out after {spec['timeout_minutes']} minutes (partial work harvested)"
+        elif result.get("opencode_exit") not in (0, None):
+            error = "; ".join(ev["errors"]) or f"opencode exited with code {result['opencode_exit']}"
+        state = "failed" if error else "succeeded"
+        set_status(tid, state=state, error=error, **changes)
+        tlog(tid, f"{state}: {changes.get('commits', 0)} commit(s), "
+                  f"{changes.get('files_changed', 0)} file(s) changed" + (f"; {error}" if error else ""))
+        if state == "failed" and exit_code not in (0, 1, None) and not result:
+            tlog(tid, "see `rsa logs <id> --sandbox` for container output")
+
+    def harvest(self, tid, spec):
+        cfg, d = self.cfg, TASKS / tid
+        repo, base = repo_path(spec["repo"]), spec["base"]
+        bundle = d / "out" / "result.bundle"
+        ref = f"refs/rsa/result/{tid}"
+        info = {"warnings": []}
+        if bundle.exists():
+            size_mb = bundle.stat().st_size / 1e6
+            if size_mb > float(cfg["max_bundle_mb"]):
+                raise RsaError(f"result bundle is {size_mb:.0f} MB (max_bundle_mb={cfg['max_bundle_mb']})")
+            git(repo, "bundle", "verify", "-q", str(bundle))
+            git(repo, "-c", "transfer.fsckObjects=true", "fetch", "-q", "--no-tags", "--no-write-fetch-head",
+                str(bundle), f"+refs/heads/rsa/{tid}:{ref}")
+            bundle.unlink()
+        else:
+            git(repo, "update-ref", ref, base)
+        result = git(repo, "rev-parse", f"{ref}^{{commit}}").stdout.strip()
+        info["result"] = result
+        if git(repo, "merge-base", "--is-ancestor", base, result, check=False).returncode != 0:
+            info["warnings"].append("result does not descend from the base commit (history was rewritten)")
+        info["commits"] = int(git(repo, "rev-list", "--count", f"{base}..{result}").stdout.strip() or 0)
+        files, ins, dels = [], 0, 0
+        for line in git(repo, "diff", "--numstat", base, result).stdout.splitlines():
+            a_, r_, path = line.split("\t", 2)
+            ins += int(a_) if a_.isdigit() else 0
+            dels += int(r_) if r_.isdigit() else 0
+            files.append(path)
+        info.update(files_changed=len(files), insertions=ins, deletions=dels, files=files[:200])
+        return info
+
+    def ensure_image(self, tid):
+        if image_hash(self.cfg) is None:
+            tlog(tid, "sandbox image missing; building it (one-time, takes a few minutes)")
+            build_image(self.cfg)
+
+    def run_args(self, tid, spec):
+        cfg, d = self.cfg, TASKS / tid
+        args = ["run", "-d", "--name", f"rsa-{tid}", "--label", f"rsa.task={tid}", "--init",
+                "--hostname", "rsa-sandbox", "--log-opt", "max-size=5m",
+                "--cpus", str(cfg["cpus"]), "--memory", str(cfg["memory"]),
+                "--memory-swap", str(cfg["memory"]), "--pids-limit", str(cfg["pids_limit"]),
+                "--security-opt", "no-new-privileges",
+                "-v", f"{repo_path(spec['repo'])}:/rsa/origin:ro",
+                "-v", f"{d / 'in'}:/rsa/in:ro",
+                "-v", f"{d / 'out'}:/rsa/out",
+                "-v", f"{cfg['data_volume']}:/root/.local/share/opencode",
+                "-e", f"RSA_TASK_ID={tid}", "-e", f"RSA_BASE={spec['base']}",
+                "-e", f"RSA_MODEL={spec['model']}", "-e", f"RSA_AGENT={spec.get('agent') or ''}",
+                "-e", f"RSA_TIMEOUT_SEC={int(spec['timeout_minutes']) * 60}",
+                "-e", f"RSA_GIT_NAME={cfg['git_name']}", "-e", f"RSA_GIT_EMAIL={cfg['git_email']}"]
+        args += sandbox_net_args(cfg)
+        if ENV_FILE.exists():
+            args += ["--env-file", str(ENV_FILE)]
+        return args + [cfg["image"], "task"]
+
+    def gc_loop(self):
+        while not self.stop.wait(3600):
+            try:
+                gc(self.cfg)
+            except Exception as e:
+                print(f"gc failed: {e!r}", flush=True)
+
+
+def sandbox_net_args(cfg):
+    args = []
+    for ns in cfg["dns"] or []:
+        args += ["--dns", str(ns)]
+    if cfg["block_private_network"]:
+        args += ["--cap-add", "NET_ADMIN", "-e", "RSA_BLOCK_PRIVATE=1"]
+    else:
+        args += ["-e", "RSA_BLOCK_PRIVATE=0"]
+    return args
+
+
+def cmd_worker(a):
+    os.environ["RSA_WORKER"] = "1"
+    for p in (TASKS, QUEUE, REPOS):
+        p.mkdir(parents=True, exist_ok=True)
+    lockf = open(RSA_HOME / "worker.lock", "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise RsaError("another worker is already running")
+    w = Worker()
+    if w.cfg["require_rootless"] and not docker_is_rootless(w.cfg):
+        raise RsaError("docker at docker_host is not rootless; refusing to run (see require_rootless)")
+    w.recover()
+    signal.signal(signal.SIGTERM, lambda *_: w.stop.set())
+    signal.signal(signal.SIGINT, lambda *_: w.stop.set())
+    n = max(1, int(w.cfg["workers"]))
+    print(f"rsa worker {VERSION} started: {n} slot(s), image {w.cfg['image']}", flush=True)
+    threads = [threading.Thread(target=w.loop, daemon=True) for _ in range(n)]
+    threads.append(threading.Thread(target=w.gc_loop, daemon=True))
+    for t in threads:
+        t.start()
+    while not w.stop.is_set():
+        w.stop.wait(1)
+    for t in threads[:-1]:
+        t.join(timeout=30)
+    print("rsa worker stopped", flush=True)
+
+
+# ------------------------------------------------------------------ maintenance
+
+def gc(cfg, verbose=False):
+    cutoff = time.time() - float(cfg["retention_days"]) * 86400
+    removed, live = [], set()
+    for tid in sorted(os.listdir(TASKS)) if TASKS.exists() else []:
+        if not ID_RE.match(tid):
+            continue
+        st = read_json(TASKS / tid / "status.json", {})
+        spec = read_json(TASKS / tid / "in" / "task.json", {})
+        fin = st.get("finished_at")
+        if st.get("state") in TERMINAL and fin and parse_iso(fin) < cutoff:
+            repo = REPOS / f"{spec.get('repo', '')}.git"
+            if spec.get("repo") and repo.exists():
+                git(repo, "update-ref", "-d", f"refs/rsa/base/{tid}", check=False)
+                git(repo, "update-ref", "-d", f"refs/rsa/result/{tid}", check=False)
+            shutil.rmtree(TASKS / tid, ignore_errors=True)
+            removed.append(tid)
+        else:
+            live.add(tid)
+    orphans = 0
+    for repo in REPOS.glob("*.git") if REPOS.exists() else []:
+        refs = git(repo, "for-each-ref", "--format=%(refname)", "refs/rsa/", check=False).stdout.split()
+        for ref in refs:
+            tid = ref.rsplit("/", 1)[-1]
+            # base refs pushed for submits that never completed: drop after a day
+            if ID_RE.match(tid) and tid not in live and id_time(tid) < time.time() - 86400:
+                git(repo, "update-ref", "-d", ref, check=False)
+                orphans += 1
+        git(repo, "gc", "--auto", "--quiet", check=False)
+    for f in (RSA_HOME / "tasks").glob("*/out.prev"):
+        if time.time() - f.stat().st_mtime > 86400 * 2:
+            shutil.rmtree(f, ignore_errors=True)
+    if removed or orphans:
+        print(f"gc: removed {len(removed)} task(s), {orphans} orphaned ref(s)", flush=True)
+    return {"removed_tasks": removed, "orphaned_refs": orphans}
+
+
+def build_image(cfg, pull=False, quiet=True):
+    h = sandbox_hash(cfg)
+    args = ["build", "-t", cfg["image"], "--label", "rsa.image=1", "--label", f"rsa.sandbox_hash={h}",
+            "--build-arg", f"OPENCODE_VERSION={cfg['opencode_version']}"]
+    if pull:
+        args.append("--pull")
+    args.append(str(APP / "sandbox"))
+    if quiet:
+        docker(*args, cfg=cfg, timeout=3600)
+    else:
+        r = subprocess.run(["docker", *args], env=docker_env(cfg))
+        if r.returncode != 0:
+            raise RsaError("image build failed")
+    docker("image", "prune", "-f", "--filter", "label=rsa.image=1", check=False, cfg=cfg)
+    return h
+
+
+def cmd_build(a):
+    cfg = load_config()
+    h = build_image(cfg, pull=a.pull, quiet=False)
+    print(f"built {cfg['image']} (sandbox hash {h})")
+
+
+def cmd_setup(a):
+    cfg = load_config()
+    for p in (RSA_HOME, REPOS, TASKS, QUEUE, SECRETS):
+        p.mkdir(parents=True, exist_ok=True)
+    os.chmod(RSA_HOME, 0o700)
+    os.chmod(SECRETS, 0o700)
+    if not CONFIG_FILE.exists():
+        write_json(CONFIG_FILE, {})
+    print(f"state directory: {RSA_HOME}")
+    if cfg["require_rootless"] and not docker_is_rootless(cfg):
+        raise RsaError(f"docker at {cfg['docker_host']} is not rootless. Install rootless docker "
+                       "(dockerd-rootless-setuptool.sh install) or set docker_host.")
+    print(f"docker: rootless daemon at {cfg['docker_host']}")
+    docker("volume", "create", cfg["data_volume"], cfg=cfg)
+    want = sandbox_hash(cfg)
+    if image_hash(cfg) != want:
+        print("building sandbox image (first build takes a few minutes)...", flush=True)
+        build_image(cfg, quiet=False)
+    print(f"sandbox image: {cfg['image']} (hash {want})")
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(APP / UNIT_NAME, unit_dir / UNIT_NAME)
+    systemctl("daemon-reload", check=True)
+    systemctl("enable", UNIT_NAME, check=True)
+    systemctl("restart", UNIT_NAME, check=True)  # running sandboxes survive; the worker re-attaches
+    linger = run(["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger"], check=False).stdout
+    print(f"worker: {worker_state()} ({UNIT_NAME})")
+    if "Linger=yes" not in linger:
+        print("WARNING: lingering is off, so the worker stops when you log out. "
+              "Fix with: sudo loginctl enable-linger $USER")
+
+
+def cmd_service(a):
+    if a.action == "logs":
+        args = ["journalctl", "--user", "-u", UNIT_NAME, "-n", str(a.lines), "--no-pager"]
+        if a.follow:
+            args.append("-f")
+        os.execvp(args[0], args)
+    if a.action == "status":
+        cfg = load_config()
+        running = [t for t in (os.listdir(TASKS) if TASKS.exists() else [])
+                   if ID_RE.match(t) and read_json(TASKS / t / "status.json", {}).get("state") == "running"]
+        emit({"worker": worker_state(), "enabled": systemctl("is-enabled", UNIT_NAME).stdout.strip(),
+              "queued": len(os.listdir(QUEUE)) if QUEUE.exists() else 0, "running": running,
+              "image": cfg["image"], "default_model": cfg["default_model"]})
+        return
+    if a.action == "stop":
+        systemctl("stop", UNIT_NAME, check=True)
+        # A deliberate stop also stops sandboxes; their tasks go back to the queue.
+        w = Worker()
+        for t in os.listdir(TASKS) if TASKS.exists() else []:
+            if ID_RE.match(t) and read_json(TASKS / t / "status.json", {}).get("state") == "running":
+                docker("rm", "-f", f"rsa-{t}", check=False, cfg=w.cfg)
+                w.requeue_or_fail(t, "stopped by `rsa server stop`", count_attempt=False)
+    else:
+        systemctl(a.action, UNIT_NAME, check=True)
+    emit({"worker": worker_state()})
+
+
+def cmd_config(a):
+    cfg = load_config()
+    if a.key is None:
+        emit(cfg)
+        return
+    if a.key not in DEFAULTS:
+        raise RsaError(f"unknown key {a.key!r}; known: {', '.join(DEFAULTS)}")
+    if a.value is None:
+        emit({a.key: cfg[a.key]})
+        return
+    overrides = read_json(CONFIG_FILE, {}) or {}
+    if a.value == "default":
+        overrides.pop(a.key, None)
+    else:
+        try:
+            value = json.loads(a.value)
+        except json.JSONDecodeError:
+            value = a.value
+        if isinstance(DEFAULTS[a.key], bool) and not isinstance(value, bool):
+            raise RsaError(f"{a.key} must be true or false")
+        if isinstance(DEFAULTS[a.key], int) and not isinstance(DEFAULTS[a.key], bool) and not isinstance(value, int):
+            raise RsaError(f"{a.key} must be an integer")
+        if isinstance(DEFAULTS[a.key], list) and not isinstance(value, list):
+            raise RsaError(f"{a.key} must be a JSON list")
+        if a.key == "default_model" and not MODEL_RE.match(str(value)):
+            raise RsaError(f"invalid model name: {value!r}")
+        overrides[a.key] = value
+    write_json(CONFIG_FILE, overrides)
+    note = None
+    if a.key in ("workers", "docker_host", "require_rootless"):
+        note = "restart the worker to apply: rsa server restart"
+    if a.key in ("opencode_version", "image"):
+        note = "rebuild the image to apply: rsa server build"
+    emit({a.key: load_config()[a.key], **({"note": note} if note else {})})
+
+
+def read_env_file():
+    if not ENV_FILE.exists():
+        return {}
+    out = {}
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, v = line.split("=", 1)
+            out[k.strip()] = v
+    return out
+
+
+def cmd_env(a):
+    env = read_env_file()
+    if a.action == "list":
+        emit({"file": str(ENV_FILE), "keys": sorted(env)})
+        return
+    if not ENV_KEY_RE.match(a.key or ""):
+        raise RsaError(f"invalid variable name: {a.key!r}")
+    if a.action == "set":
+        value = sys.stdin.buffer.read().decode("utf-8").strip()
+        if not value or "\n" in value:
+            raise RsaError("value must be a single non-empty line on stdin")
+        env[a.key] = value
+    else:
+        env.pop(a.key, None)
+    SECRETS.mkdir(parents=True, exist_ok=True)
+    os.chmod(SECRETS, 0o700)
+    tmp = ENV_FILE.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("".join(f"{k}={v}\n" for k, v in sorted(env.items())))
+    os.replace(tmp, ENV_FILE)
+    emit({"file": str(ENV_FILE), "keys": sorted(env), "note": "applies to tasks started from now on"})
+
+
+def interactive_sandbox(cfg, mode, extra=(), env=()):
+    """Run a throwaway sandbox container attached to the caller's terminal."""
+    args = ["docker", "run", "--rm", "-i", "--init", "--label", "rsa.interactive=1",
+            "--cpus", str(cfg["cpus"]), "--memory", str(cfg["memory"]), "--pids-limit", str(cfg["pids_limit"]),
+            "--security-opt", "no-new-privileges",
+            "-v", f"{cfg['data_volume']}:/root/.local/share/opencode"]
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        args.append("-t")
+    args += sandbox_net_args(cfg)
+    for e in env:
+        args += ["-e", e]
+    if ENV_FILE.exists():
+        args += ["--env-file", str(ENV_FILE)]
+    args += [cfg["image"], mode, *extra]
+    sys.stdout.flush()
+    return subprocess.run(args, env=docker_env(cfg)).returncode
+
+
+def cmd_auth(a):
+    sys.exit(interactive_sandbox(load_config(), "opencode", ["auth", *a.args, "--standalone"]))
+
+
+def cmd_models(a):
+    sys.exit(interactive_sandbox(load_config(), "opencode", ["models", "--standalone", *a.args]))
+
+
+def cmd_shell(a):
+    sys.exit(interactive_sandbox(load_config(), "shell"))
+
+
+def host_probe_targets():
+    targets = []
+    ts = run(["tailscale", "ip", "-4"], check=False).stdout.split()
+    if ts:
+        targets.append(f"{ts[0]}:22")
+    route = run(["ip", "-4", "route", "get", "1.1.1.1"], check=False).stdout
+    m = re.search(r"src (\S+)", route)
+    if m:
+        targets.append(f"{m.group(1)}:22")
+    m = re.search(r"via (\S+)", route)
+    if m:
+        targets.append(f"{m.group(1)}:80")
+    return targets
+
+
+def cmd_selftest(a):
+    cfg = load_config()
+    blocked = host_probe_targets() if cfg["block_private_network"] else []
+    print(f"probing from a sandbox; must be blocked: {' '.join(blocked) or '(firewall disabled)'}", flush=True)
+    rc = interactive_sandbox(cfg, "selftest", env=[f"RSA_PROBE_BLOCKED={' '.join(blocked)}",
+                                                    "RSA_PROBE_OPEN=1.1.1.1:443"])
+    sys.exit(rc)
+
+
+def cmd_doctor(a):
+    cfg = load_config()
+    checks = []
+
+    def check(name, ok, detail=""):
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    check("python", sys.version_info >= (3, 9), sys.version.split()[0])
+    check("git", shutil.which("git"), run(["git", "--version"], check=False).stdout.strip())
+    docker_ok = False
+    try:
+        rootless = docker_is_rootless(cfg)
+        docker_ok = True
+        check("docker daemon", True, cfg["docker_host"])
+        check("docker is rootless", rootless or not cfg["require_rootless"],
+              "rootless" if rootless else "ROOTFUL: containers would run as real root")
+    except (RsaError, subprocess.TimeoutExpired) as e:
+        check("docker daemon", False, str(e))
+    if docker_ok:
+        have, want = image_hash(cfg), sandbox_hash(cfg)
+        check("sandbox image", have == want,
+              "up to date" if have == want else ("missing" if have is None else "stale: run `rsa server build`"))
+        vol = docker("volume", "inspect", cfg["data_volume"], check=False, cfg=cfg).returncode == 0
+        check("opencode data volume", vol, cfg["data_volume"])
+        stray = docker("ps", "-a", "--filter", "label=rsa.task", "--format", "{{.Names}} {{.Status}}",
+                       check=False, cfg=cfg).stdout.strip()
+        check("sandbox containers", True, stray.replace("\n", "; ") or "none")
+    ws = worker_state()
+    check("worker service", ws == "active", f"{UNIT_NAME}: {ws}")
+    linger = run(["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger"], check=False).stdout
+    check("user lingering (worker survives logout/reboot)", "Linger=yes" in linger, linger.strip())
+    ctrl = Path(f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/cgroup.controllers")
+    have_ctrl = set(ctrl.read_text().split()) if ctrl.exists() else set()
+    check("cgroup limits (cpu, memory, pids)", {"cpu", "memory", "pids"} <= have_ctrl,
+          " ".join(sorted(have_ctrl)) or "unknown")
+    du = shutil.disk_usage(RSA_HOME if RSA_HOME.exists() else Path.home())
+    check("disk space", du.free > 5e9, f"{du.free / 1e9:.0f} GB free")
+    if ENV_FILE.exists():
+        mode = ENV_FILE.stat().st_mode & 0o777
+        check("secrets file permissions", mode == 0o600, f"{ENV_FILE} mode {oct(mode)}")
+    states = {}
+    for t in os.listdir(TASKS) if TASKS.exists() else []:
+        if ID_RE.match(t):
+            s = read_json(TASKS / t / "status.json", {}).get("state", "?")
+            states[s] = states.get(s, 0) + 1
+    check("tasks", True, ", ".join(f"{k}: {v}" for k, v in sorted(states.items())) or "none")
+    check("default model", True, cfg["default_model"])
+    emit({"ok": all(c["ok"] for c in checks), "version": VERSION, "home": str(RSA_HOME), "checks": checks})
+
+
+def cmd_gc(a):
+    emit(gc(load_config()))
+
+
+def cmd_version(a):
+    emit({"version": VERSION, "home": str(RSA_HOME)})
+
+
+# ------------------------------------------------------------------ main
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    p = argparse.ArgumentParser(prog="rsa-server", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("ensure-repo"); s.add_argument("repo"); s.set_defaults(fn=cmd_ensure_repo)
+    s = sub.add_parser("submit", help="queue a task (JSON request on stdin)"); s.set_defaults(fn=cmd_submit)
+    s = sub.add_parser("status"); s.add_argument("id"); s.add_argument("--prompt", action="store_true")
+    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("list"); s.add_argument("--repo"); s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--active", action="store_true"); s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("wait"); s.add_argument("id"); s.add_argument("--timeout", type=int, default=300)
+    s.set_defaults(fn=cmd_wait)
+    s = sub.add_parser("logs"); s.add_argument("id"); s.add_argument("-f", "--follow", action="store_true")
+    s.add_argument("--raw", action="store_true"); s.add_argument("--sandbox", action="store_true")
+    s.add_argument("-n", "--tail", type=int, default=0); s.set_defaults(fn=cmd_logs)
+    s = sub.add_parser("cancel"); s.add_argument("id"); s.set_defaults(fn=cmd_cancel)
+    s = sub.add_parser("retry"); s.add_argument("id"); s.add_argument("--model"); s.set_defaults(fn=cmd_retry)
+
+    s = sub.add_parser("worker", help="run the worker loop (systemd)"); s.set_defaults(fn=cmd_worker)
+    s = sub.add_parser("setup", help="create state dirs, build image, install + start the worker")
+    s.set_defaults(fn=cmd_setup)
+    s = sub.add_parser("build"); s.add_argument("--pull", action="store_true"); s.set_defaults(fn=cmd_build)
+    s = sub.add_parser("service"); s.add_argument("action", choices=["start", "stop", "restart", "status", "logs"])
+    s.add_argument("-f", "--follow", action="store_true"); s.add_argument("-n", "--lines", type=int, default=100)
+    s.set_defaults(fn=cmd_service)
+    s = sub.add_parser("config"); s.add_argument("key", nargs="?"); s.add_argument("value", nargs="?")
+    s.set_defaults(fn=cmd_config)
+    s = sub.add_parser("env", help="manage provider API keys passed to sandboxes")
+    s.add_argument("action", choices=["list", "set", "unset"]); s.add_argument("key", nargs="?")
+    s.set_defaults(fn=cmd_env)
+    s = sub.add_parser("auth", help="run `opencode auth ...` against the sandbox credential store")
+    s.add_argument("args", nargs=argparse.REMAINDER); s.set_defaults(fn=cmd_auth)
+    s = sub.add_parser("models"); s.add_argument("args", nargs=argparse.REMAINDER); s.set_defaults(fn=cmd_models)
+    s = sub.add_parser("shell", help="interactive shell in a throwaway sandbox"); s.set_defaults(fn=cmd_shell)
+    s = sub.add_parser("selftest", help="verify sandbox isolation"); s.set_defaults(fn=cmd_selftest)
+    s = sub.add_parser("doctor"); s.set_defaults(fn=cmd_doctor)
+    s = sub.add_parser("gc"); s.set_defaults(fn=cmd_gc)
+    s = sub.add_parser("version"); s.set_defaults(fn=cmd_version)
+
+    a = p.parse_args()
+    try:
+        a.fn(a)
+    except RsaError as e:
+        emit({"ok": False, "error": str(e)})
+        sys.exit(2)
+    except subprocess.TimeoutExpired as e:
+        emit({"ok": False, "error": f"timed out: {' '.join(map(str, e.cmd[:3]))}"})
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

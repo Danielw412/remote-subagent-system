@@ -1,0 +1,18 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "allow" },
+    { "action": "question", "resource": "*", "effect": "deny" }
+  ],
+  "agents": {
+    "build": {
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "allow" },
+        { "action": "question", "resource": "*", "effect": "deny" }
+      ]
+    }
+  },
+  "update": "disable",
+  "share": "disabled",
+  "snapshots": false
+}

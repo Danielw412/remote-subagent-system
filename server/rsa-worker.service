@@ -1,0 +1,21 @@
+[Unit]
+Description=rsa remote-agent worker (runs queued OpenCode tasks in rootless Docker sandboxes)
+After=docker.service
+Wants=docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.rsa/app/rsa-server worker
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+# SIGTERM goes to the worker only; it leaves sandboxes running and re-attaches on start.
+KillMode=mixed
+# The worker only orchestrates; the sandboxes carry their own cgroup limits.
+MemoryMax=256M
+Nice=5
+
+[Install]
+WantedBy=default.target
