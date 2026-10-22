@@ -27,7 +27,8 @@ VERSION = "1.0.0"
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent
 CONFIG_PATH = Path.home() / ".config" / "rsa" / "config.json"
-DEFAULTS = {"host": "linuxbox", "remote": "~/.rsa/app/rsa-server", "ssh": "ssh"}
+DEFAULTS = {"host": "linuxbox", "remote": "~/.rsa/app/rsa-server", "ssh": "ssh",
+            "bridge_port": "47960", "bridge_instance": "default", "bridge_password": ""}
 ENV_OVERRIDES = {"host": "RSA_HOST", "remote": "RSA_REMOTE", "ssh": "RSA_SSH"}
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
@@ -65,11 +66,14 @@ def remote_cmd(args):
     return CFG["remote"] + " " + " ".join(shlex.quote(str(a)) for a in args)
 
 
-def call(args, payload=None, retries=2):
+def call(args, payload=None, retries=2, timeout=None):
     """Run an rsa-server command and return its parsed JSON reply."""
     data = b"" if payload is None else json.dumps(payload).encode("utf-8")
     for attempt in range(retries + 1):
-        p = subprocess.run(ssh_base() + [remote_cmd(args)], input=data, capture_output=True)
+        try:
+            p = subprocess.run(ssh_base() + [remote_cmd(args)], input=data, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RsaError(f"`{args[0]}` on {CFG['host']} timed out after {timeout}s")
         if p.returncode != 255 or attempt == retries:
             break
         time.sleep(2 * (attempt + 1))  # transient network/ssh failure
@@ -514,6 +518,22 @@ def cmd_doctor(a):
         return EXIT_FAILED
     for c in rep["checks"]:
         line(c["ok"], c["name"], c["detail"])
+    print("T3 bridge:")
+    sys.path.insert(0, str(HERE))
+    import rsa_bridge
+    rsa_bridge.core = sys.modules[__name__]
+    st = rsa_bridge.running_status()
+    line(bool(st and st.get("upstream") == "connected"), "bridge", (
+        f"running on {rsa_bridge.bridge_url()}, sandbox server {st['upstream']}" if st else
+        "not running (`rsa bridge start`; `rsa bridge autostart on` to start at logon)"))
+    try:
+        inst = json.loads(rsa_bridge.T3_SETTINGS.read_text(encoding="utf-8")).get("providerInstances", {})
+        entry = next((v for v in inst.values() if (v.get("config") or {}).get("serverUrl") == rsa_bridge.bridge_url()),
+                     None)
+        line(bool(entry and entry.get("enabled", True)), "T3 provider instance",
+             entry.get("displayName", "?") if entry else "missing (`rsa bridge t3-install`)")
+    except (OSError, ValueError):
+        print("  [info] T3 Code settings not found (T3 integration not set up on this machine)")
     print("\nall checks passed" if ok else "\nsome checks failed (see README troubleshooting)")
     return 0 if ok else EXIT_FAILED
 
@@ -555,7 +575,7 @@ def server_bundle():
             data = f.read_bytes().replace(b"\r\n", b"\n")
             info = tarfile.TarInfo(f.relative_to(src).as_posix())
             info.size, info.mtime = len(data), int(time.time())
-            info.mode = 0o755 if f.name in ("rsa-server", "entrypoint.sh") else 0o644
+            info.mode = 0o755 if f.name in ("rsa-server", "entrypoint.sh", "rsa-ws", "rsa-ignore-build-trees") else 0o644
             tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
 
@@ -584,6 +604,12 @@ def cmd_server(a):
         return passthrough(["env", "set", rest[1]], stdin_data=value.strip().encode("utf-8"))
     tty = act in ("auth", "shell") and sys.stdin.isatty()
     return passthrough([act, *rest], tty=tty)
+
+
+def cmd_bridge(a):
+    sys.path.insert(0, str(HERE))
+    import rsa_bridge
+    return rsa_bridge.main(a, sys.modules[__name__])
 
 
 def cmd_install(a):
@@ -674,6 +700,28 @@ def main():
     s.add_argument("action", choices=["install", "setup", "start", "stop", "restart", "status", "logs", "build",
                                       "config", "env", "auth", "models", "shell", "selftest", "gc", "doctor"])
     s.add_argument("args", nargs=argparse.REMAINDER)
+
+    s = sub.add_parser("bridge", help="T3 Code integration: sandboxed OpenCode as a native T3 provider")
+    bsub = s.add_subparsers(dest="bridge_cmd", required=True)
+    bsub.add_parser("run", help="run the bridge in the foreground")
+    b = bsub.add_parser("start", help="start the bridge in the background")
+    b.add_argument("--wait", type=int, default=30, help="seconds to wait for the sandbox server")
+    b = bsub.add_parser("stop"); b.add_argument("--remote", action="store_true", help="also stop the sandbox server")
+    b = bsub.add_parser("restart"); b.add_argument("--remote", action="store_true",
+                                                   help="also recreate the sandbox server (after image updates)")
+    b.add_argument("--wait", type=int, default=30)
+    b = bsub.add_parser("status"); b.add_argument("--json", action="store_true")
+    b = bsub.add_parser("logs"); b.add_argument("-f", "--follow", action="store_true")
+    b.add_argument("-n", "--lines", type=int, default=60)
+    b = bsub.add_parser("t3-install", help="add (or --remove) the provider instance in T3 Code settings")
+    b.add_argument("--id", default="opencode_linux"); b.add_argument("--name", default="OpenCode · Linux sandbox")
+    b.add_argument("--remove", action="store_true")
+    b = bsub.add_parser("autostart", help="start the bridge at Windows logon")
+    b.add_argument("state", choices=["on", "off"])
+    b = bsub.add_parser("forget", help="drop a workspace mapping (bridge must be stopped)")
+    b.add_argument("dir", nargs="?"); b.add_argument("--all", action="store_true")
+    b.add_argument("--missing", action="store_true", help="workspaces whose Windows directory no longer exists")
+    s.set_defaults(fn=cmd_bridge)
 
     a = p.parse_args()
     if a.cmd == "status" and a.id and not ID_RE.match(a.id):

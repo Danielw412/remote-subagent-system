@@ -10,12 +10,22 @@ OpenCode models.
 """
 import argparse
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+def rmtree(path):
+    """shutil.rmtree that also removes git's read-only object files on Windows."""
+    def retry(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    shutil.rmtree(path, onerror=retry)
+
 
 RSA = [sys.executable, str(Path(__file__).resolve().parent.parent / "client" / "rsa.py")]
 RESULTS = []
@@ -198,7 +208,7 @@ def main():
             resilience(repo)
     finally:
         if not a.keep:
-            shutil.rmtree(tmp, ignore_errors=True)
+            rmtree(tmp)
     failed = [n for n, ok in RESULTS if not ok]
     print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
     for n in failed:

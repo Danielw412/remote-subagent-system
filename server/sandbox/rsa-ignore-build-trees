@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Keep CMake build trees out of agent results. Run in a git worktree just before `git add -A`:
+# each untracked directory that holds a CMakeCache.txt and no tracked files is appended to the
+# repository's info/exclude. A configure into build/ inside the checkout then cannot flood a
+# result bundle (or, through the bridge, the user's checkout) with build output. Excluded trees
+# are not deleted, so incremental builds also survive `rsa-ws reset`.
+#
+# Honors GIT_INDEX_FILE: `rsa-ws export` runs this against a temporary index of the base commit.
+# An in-source build at the repository root is left alone; its output cannot be told apart from
+# the sources.
+set -euo pipefail
+
+g() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 "$@"; }
+
+exclude=$(g rev-parse --git-path info/exclude)
+mkdir -p "$(dirname "$exclude")"
+skipped=()
+# ls-files output is sorted, so a build tree's own CMakeCache.txt comes before those of the
+# FetchContent sub-builds inside it (_deps/*-subbuild) and those are covered by its entry.
+while IFS= read -r -d '' f; do
+  case "$f" in */CMakeCache.txt) d=${f%/CMakeCache.txt} ;; *) continue ;; esac
+  case "$d" in *$'\n'*) continue ;; esac  # not expressible as an exclude pattern
+  for p in "${skipped[@]}"; do
+    case "$d/" in "$p"/*) continue 2 ;; esac
+  done
+  if g --literal-pathspecs ls-files --error-unmatch -- "$d" >/dev/null 2>&1; then
+    continue  # holds tracked files: not purely build output
+  fi
+  printf '/%s/\n' "$(printf '%s' "$d" | sed 's/[][*?\\]/\\&/g')" >>"$exclude"
+  skipped+=("$d")
+  echo "leaving CMake build tree out of the result: $d/" >&2
+done < <(g ls-files -z --others --exclude-standard)

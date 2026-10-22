@@ -1,8 +1,14 @@
 # remote-subagent-system (`rsa`)
 
 Delegate coding tasks from an orchestrator (T3 Code, Codex, or Claude Code on Windows) to
-unattended [OpenCode](https://opencode.ai) agents. Each agent runs in its own disposable,
-rootless Docker sandbox on a Linux server, connected over Tailscale.
+[OpenCode](https://opencode.ai) agents (DeepSeek, Gemini, and other models). Each agent runs in a
+rootless Docker sandbox on a Linux server, connected over Tailscale. There are two ways in:
+
+- **Inside T3 Code**, as a native provider called **"OpenCode · Linux sandbox"**. Threads and
+  `delegate_task` children show messages, tool calls, approvals, and diffs in T3, and can be
+  interrupted, continued, and reviewed like any other T3 thread. See
+  [T3 Code integration](#t3-code-integration).
+- **Headless**, with `rsa submit`: an unattended queue whose results come back as git refs (described below).
 
 ```
  Windows laptop (orchestrator)                       latitude7370 (Linux Mint, Tailscale)
@@ -56,6 +62,131 @@ rsa server selftest       # proves the sandbox cannot reach the LAN, the tailnet
 ```
 
 The client defaults to SSH host `linuxbox`. Change it with `rsa config host <alias>` or the `RSA_HOST` env var.
+
+## T3 Code integration
+
+T3 Code is not modified. The integration uses T3's supported OpenCode provider with an external
+`serverUrl`, a provider-instance entry in T3's `settings.json` that T3 hot-reloads, and a small local bridge:
+
+```
+ T3 Code (Windows)                    rsa bridge (Windows, 127.0.0.1:47960)        latitude7370
+ provider instance "opencode_linux"   OpenCode v2 API proxy                        rsa-oc-default container
+ serverUrl=http://127.0.0.1:47960 ──▶ - Windows path <-> /ws/<name>-<key>  ──ssh──▶ opencode serve (sandboxed)
+ (threads, delegate_task children)    - before a turn: checkout -> sandbox  tunnel   /ws/<workspaces>
+                                      - turn end: sandbox -> checkout,               firewall from a helper,
+                                        then the completion reaches T3               no NET_ADMIN at all
+```
+
+**How work flows.** Each thread directory (a project root, or a T3 worktree for
+`isolation: "worktree"`) gets its own sandbox workspace. Before each turn, the checkout's files
+(committed, uncommitted, and untracked, honouring `.gitignore`) are copied in. When the turn
+ends, the bridge holds T3's completion event until the agent's changed files are written into the
+checkout. T3's per-turn checkpoints, diff panel, and commit/PR flow then work as for a local agent.
+Only working-tree files come back: never `.git`, the repo's `core.hooksPath` directory, symlinks or
+junctions, Windows 8.3 short-name aliases (such as `GITHOO~1`), or anything whose resolved path
+falls outside the checkout. Files are compared and written as raw bytes; no git clean/smudge filters
+run on agent content. Git runs on agent-controlled directories only inside the sandbox. Each
+workspace receives only its own repository's objects, streamed in as git bundles; no host
+repository is mounted into the sandbox server.
+If you edit a file locally while a turn is running, your version wins, and `rsa bridge status`
+lists it as a conflict.
+
+### Setup (one time)
+
+```powershell
+rsa server install            # deploy/update the server side (adds the bridge server mode)
+rsa bridge start              # local bridge + sandboxed OpenCode server on the Linux host
+rsa bridge t3-install         # adds the "OpenCode · Linux sandbox" provider to T3 (backs up settings.json)
+rsa bridge autostart on       # start the bridge at Windows logon (Startup folder entry)
+
+# DeepSeek / Gemini API models (free OpenCode models, incl. DeepSeek V4.1 Flash Free, need no key)
+rsa server env set DEEPSEEK_API_KEY      # unlocks deepseek/* models
+rsa server env set GEMINI_API_KEY        # unlocks google/gemini-* models
+rsa bridge restart --remote              # the sandbox server reads keys when its container starts
+```
+
+### Daily use
+
+- **Manual:** in T3 pick the provider **OpenCode · Linux sandbox** and a model. With
+  **Full access** the agent runs unattended (shell, edits, package installs) inside the sandbox
+  only. In **Auto** or stricter modes, T3 asks you to approve each command and edit, as with any OpenCode thread.
+- **From an orchestrator** (Codex, Claude): `delegate_task` with
+  `target {"providerInstanceId": "opencode_linux", "model": "..."}`. T3 never lets a child run with
+  broader permissions than its parent. A child of an **Auto** orchestrator therefore asks you to
+  approve shell commands and edits in the child thread. `runtimeMode: "auto-accept-edits"` lets
+  file-only work run without approvals. For fully unattended shell work from an Auto orchestrator,
+  use `rsa submit`.
+- **Monitor, interrupt, interact, and reconnect:** use T3 as usual (stop button, follow-up messages,
+  `task_cancel`, `t3_thread_send`). Sessions live in the sandbox server and survive restarts of
+  T3 and of the bridge; on reconnect, the bridge brings back changes made while it was away.
+- **Review:** use T3's diff panel and checkpoints for the thread's checkout (or worktree), then
+  commit, merge, or open a PR from T3.
+
+### Bridge commands
+
+| Command | Purpose |
+|---|---|
+| `rsa bridge start` / `stop [--remote]` / `restart [--remote]` | run the bridge; `--remote` also stops or recreates the sandbox server container (needed after `rsa server env set` or image updates) |
+| `rsa bridge status [--json]` | connection, busy sessions, workspaces, last sync, conflicts, errors |
+| `rsa bridge logs [-f]` | bridge log (`~/.rsa/bridge/bridge.log`); set `RSA_BRIDGE_TRACE=1` before `start` to log every request |
+| `rsa bridge t3-install [--remove]` | add or remove the T3 provider instance (`--id`, `--name` to customize) |
+| `rsa bridge autostart on\|off` | Startup-folder entry that runs `rsa bridge start` at logon |
+| `rsa bridge forget <dir>\|--missing\|--all` | drop workspace mappings and delete their sandbox copies (bridge stopped); `--missing` prunes checkouts that no longer exist, such as merged T3 worktrees |
+| `rsa server auth --bridge default login` | OAuth logins for the bridge server's own credential store |
+
+Settings (client config, `rsa config <key> <value>`): `bridge_port` (47960), `bridge_instance`
+(`default`; one sandbox server per instance), `bridge_password` (optional; if set, put the same
+value in T3's provider settings as *Server password*). The bridge only listens on
+127.0.0.1. It rejects requests that carry a browser `Origin` or `Sec-Fetch-Site`, and Host
+headers other than localhost (DNS rebinding).
+
+### Verified
+
+These were exercised against the live system:
+- Delegation from a T3 thread (`delegate_task`, DeepSeek V4.1 Flash Free) showed messages, reasoning,
+  tool calls, file changes, and T3 checkpoints listing the agent's files.
+- Two-way sync: a local deletion reached the sandbox before the next turn, and new files came back after it.
+- Follow-up messages to the same child thread.
+- Auto-mode approval requests surfaced in T3 (not bypassed).
+- Interrupt via `task_cancel`.
+- Bridge restart while idle and **during** a running turn: the turn finished, files synced, and the checkpoint was correct.
+- Full-access session emulation (`tests/bridge_api_test.py`, 16/16 checks):
+  - commands ran in the sandbox's Linux workspace without `NET_ADMIN`;
+  - internet allowed; LAN, tailnet, and host blocked (checked by the agent *and* deterministically);
+  - firewall immutable for agent-level root;
+  - edits and shell-created files synced back; `.git` untouched;
+  - a local edit made during a turn was kept and reported as a conflict.
+- Write-back hardening (`tests/bridge_apply_test.py`, 11/11, offline). Hostile trees are refused:
+  the hooks directory, its real 8.3 alias `GITHOO~1`, nested `.GIT`, and trailing-dot names. CRLF
+  checkouts are handled without filters.
+- An independent security review (separate agent) found the 8.3-alias, git-filter, and shared-repo-mount
+  issues; all three are fixed above and re-tested.
+
+### Not verified / limitations
+
+- **Gemini and paid DeepSeek models.** Configuring the API keys makes them appear (checked with
+  dummy keys), but no real key was available, so actual runs with them are untested.
+- **Full Access started from the T3 UI.** It wasn't clicked through. It sends exactly the allow-all
+  rule that the API test emulates.
+- **T3 restart during a running turn.** Not tested (the server and sessions persist; T3 reconnects by session id).
+- **Thread directories that are not git repositories** (e.g. T3 scratch threads) get a sandbox
+  workspace but no file sync.
+- **Worktree isolation needs a commit.** `isolation: "worktree"` children need the parent branch to
+  have a commit (a T3 rule).
+- **Shared sandbox server.** All threads of one bridge instance share one container, so they
+  share its CPU and memory limits and can read and modify each other's workspaces. Changes in another
+  workspace still return to that repo only through its own write-back checks. Use another
+  `bridge_instance` (with its own T3 provider entry and port) for stronger separation.
+- **The agent can read the container's secrets.** These are the provider API keys and the sandbox
+  OpenCode server's password, because OpenCode runs tools inside its server process. An agent
+  allowed to run shell commands (Full Access, or approved commands) can therefore call that server
+  directly. That includes answering its own approval prompts and reading other sessions in the same
+  instance. This never extends beyond the sandbox, but an approval policy inside one instance is
+  only as strong as the shell permission. Use low-limit API keys.
+- **No T3 orchestration tools.** Sandboxed agents don't get T3's MCP tools, because T3 doesn't inject
+  them into external OpenCode servers. That is intentional here.
+- **Path display.** Tool *outputs* show the Linux paths the agent actually used (`/ws/...`); path
+  fields (tool inputs, file changes) are shown as Windows paths.
 
 ### Model credentials
 
@@ -203,6 +334,10 @@ Residual risks you should know about:
 | `belongs to repo X, but this is Y` | run `rsa result/diff` inside the repository the task came from |
 | image `stale` in doctor | `rsa server build` (or `rsa server install`) |
 | worker gone after logout/reboot | needs lingering: `sudo loginctl enable-linger daniel` (already enabled here) |
+| T3 shows the sandbox provider with an error | `rsa bridge status`; `rsa bridge start` (enable `rsa bridge autostart on`) |
+| sandbox thread turn fails to start | `rsa bridge logs` (look for `bridge error` / `workspace preparation failed`) |
+| agent's changes missing from the checkout | `rsa bridge status` shows `conflicts` (your local edits won) or `last_error`; the agent's version is in `refs/rsa/ws/<key>` |
+| new API key not picked up by T3 threads | `rsa bridge restart --remote` |
 | want a clean slate | `rsa server stop`, then on the server `rm -rf ~/.rsa/tasks/* ~/.rsa/queue/*`, then `rsa server start` |
 
 ## Reverse engineering tools
@@ -248,6 +383,39 @@ or require a model. For the tool test alone inside a sandbox:
 python3 /etc/rsa/reverse-engineering-selftest.py
 ```
 
+## C and C++ builds with CMake
+
+Every sandbox includes [CMake 4.4.4](https://github.com/Kitware/CMake/releases/tag/v4.4.4)
+(`cmake`, `ctest`, `cpack` from Kitware's release build, checked against its SHA-256),
+Ninja, GCC/G++, GNU Make, and `pkg-config`. The agent instructions at `/etc/rsa/cmake.md`
+are loaded by the same additive config as the reverse engineering tools. They tell
+agents to configure out of tree (`cmake -S . -B /tmp/build/<project> -G Ninja`), use
+the project's `CMakePresets.json` when present, run tests with `ctest`, and report any
+Debian `-dev` packages they had to install.
+
+CMake build trees are filtered out of results. Before harvesting, the queue's auto-commit and
+the bridge's write-back run `rsa-ignore-build-trees`. It adds every untracked directory
+that holds a `CMakeCache.txt` and no tracked files to the workspace's `.git/info/exclude`,
+so a configure into `build/` inside the checkout does not reach your checkout or count
+toward `max_bundle_mb`. In bridge workspaces those trees are kept, so incremental builds
+survive between turns. An in-source build at the repository root (`cmake .`) cannot be
+told apart from sources and is not filtered. Neither is build output that an agent
+commits itself.
+
+CMake 4 no longer configures projects whose `cmake_minimum_required` is below 3.5.
+Agents are told to retry with `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` and to say so,
+rather than editing the project. Compilers share the sandbox's `cpus` and `memory`
+limits. For large C++ builds, raise `rsa server config memory` or ask for fewer
+parallel jobs.
+
+`rsa server selftest` builds and tests a small C/C++ project with both the Ninja and
+Makefile generators, and checks the build-tree filter. To run it alone inside a
+sandbox:
+
+```bash
+bash /etc/rsa/cmake-selftest.sh
+```
+
 ## Limitations
 
 - Agents see committed state (or a `--dirty` snapshot). Git submodules are not populated, and
@@ -266,10 +434,13 @@ python3 /etc/rsa/reverse-engineering-selftest.py
 # on the server
 systemctl --user disable --now rsa-worker.service && rm ~/.config/systemd/user/rsa-worker.service
 docker rm -f $(docker ps -aq --filter label=rsa.task) 2>/dev/null; docker rmi rsa-sandbox:latest; docker volume rm rsa-opencode-data
+docker rm -f rsa-oc-default; docker volume rm rsa-oc-default-data
 rm -rf ~/.rsa
 ```
 ```powershell
 # on Windows
+rsa bridge stop; rsa bridge autostart off; rsa bridge t3-install --remove
+Remove-Item ~\.rsa\bridge -Recurse
 Remove-Item ~\.local\bin\rsa, ~\.local\bin\rsa.cmd, ~\.claude\skills\remote-agents, ~\.codex\skills\remote-agents -Recurse
 git for-each-ref --format="%(refname)" refs/rsa/ | ForEach-Object { git update-ref -d $_ }   # per repo
 ```
@@ -277,12 +448,19 @@ git for-each-ref --format="%(refname)" refs/rsa/ | ForEach-Object { git update-r
 ## Repository layout
 
 ```
+AGENTS.md                     guidance for coding agents working on this repo
 client/rsa.py                 Windows/any-OS client (stdlib Python)
+client/rsa_bridge.py          T3 bridge: local OpenCode-compatible endpoint, path mapping, file sync
 server/rsa-server             server CLI + worker (stdlib Python)
 server/rsa-worker.service     systemd user unit
 server/sandbox/Dockerfile     sandbox image
 server/sandbox/entrypoint.sh  in-container firewall, workspace, opencode run, result bundle
-server/sandbox/opencode.json  OpenCode config for sandboxes (permissions, no updates/sharing/snapshots)
+server/sandbox/rsa-ignore-build-trees  keeps CMake build trees out of task results and write-back
+server/sandbox/cmake.md       agent instructions for CMake builds (cmake-selftest.sh: its selftest)
+server/sandbox/opencode.json  OpenCode config for headless tasks (permissions, no updates/sharing/snapshots)
+server/sandbox/opencode-server.json  OpenCode config for the bridge server (T3 supplies per-session rules)
+server/sandbox/rsa-ws         workspace operations run inside the bridge server (init/reset/export)
 skill/remote-agents/SKILL.md  instructions for Claude Code / Codex orchestrators
-tests/e2e.py                  end-to-end test against the live server
+tests/e2e.py                  end-to-end test of the headless queue against the live server
+tests/bridge_api_test.py      end-to-end test of the bridge (full-access emulation, isolation, sync)
 ```

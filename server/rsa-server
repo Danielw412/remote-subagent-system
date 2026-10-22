@@ -59,6 +59,7 @@ DEFAULTS = {
     "git_name": "rsa-agent",
     "git_email": "rsa-agent@localhost",
     "data_volume": "rsa-opencode-data",
+    "oc_idle_hours": 12,
 }
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -771,6 +772,7 @@ class Worker:
         while not self.stop.wait(3600):
             try:
                 gc(self.cfg)
+                oc_gc(self.cfg)
             except Exception as e:
                 print(f"gc failed: {e!r}", flush=True)
 
@@ -1005,12 +1007,12 @@ def cmd_env(a):
     emit({"file": str(ENV_FILE), "keys": sorted(env), "note": "applies to tasks started from now on"})
 
 
-def interactive_sandbox(cfg, mode, extra=(), env=()):
+def interactive_sandbox(cfg, mode, extra=(), env=(), volume=None):
     """Run a throwaway sandbox container attached to the caller's terminal."""
     args = ["docker", "run", "--rm", "-i", "--init", "--label", "rsa.interactive=1",
             "--cpus", str(cfg["cpus"]), "--memory", str(cfg["memory"]), "--pids-limit", str(cfg["pids_limit"]),
             "--security-opt", "no-new-privileges",
-            "-v", f"{cfg['data_volume']}:/root/.local/share/opencode"]
+            "-v", f"{volume or cfg['data_volume']}:/root/.local/share/opencode"]
     if sys.stdin.isatty() and sys.stdout.isatty():
         args.append("-t")
     args += sandbox_net_args(cfg)
@@ -1024,7 +1026,8 @@ def interactive_sandbox(cfg, mode, extra=(), env=()):
 
 
 def cmd_auth(a):
-    sys.exit(interactive_sandbox(load_config(), "opencode", ["auth", *a.args, "--standalone"]))
+    volume = oc_paths(a.bridge)["volume"] if a.bridge else None
+    sys.exit(interactive_sandbox(load_config(), "opencode", ["auth", *a.args, "--standalone"], volume=volume))
 
 
 def cmd_models(a):
@@ -1057,6 +1060,229 @@ def cmd_selftest(a):
     rc = interactive_sandbox(cfg, "selftest", env=[f"RSA_PROBE_BLOCKED={' '.join(blocked)}",
                                                     "RSA_PROBE_OPEN=1.1.1.1:443"])
     sys.exit(rc)
+
+
+# ------------------------------------------------------------------ T3 bridge servers (oc-*)
+#
+# `rsa bridge` on Windows exposes one long-lived OpenCode server per instance to T3 Code.
+# That server runs in a sandbox container that never holds NET_ADMIN; its egress
+# firewall is installed by a one-shot helper joined to its network namespace. Each
+# Windows checkout gets a workspace in ~/.rsa/oc/<instance>/ws/<dir>, and git only
+# ever runs on those workspaces inside the container (rsa-ws), never on the host.
+
+OC_ROOT = RSA_HOME / "oc"
+INSTANCE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+WSDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
+
+
+def oc_paths(inst):
+    if not INSTANCE_RE.match(inst or ""):
+        raise RsaError(f"invalid bridge instance name: {inst!r}")
+    d = OC_ROOT / inst
+    return {"inst": inst, "dir": d, "state": d / "server.json", "ws": d / "ws", "fw": d / "fw",
+            "heartbeat": d / "heartbeat", "container": f"rsa-oc-{inst}", "volume": f"rsa-oc-{inst}-data"}
+
+
+def free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def oc_health(port, password, timeout=5):
+    import base64
+    import urllib.request
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/info")
+    req.add_header("Authorization", "Basic " + base64.b64encode(f"opencode:{password}".encode()).decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read()).get("version")
+    except Exception:
+        return None
+
+
+def container_state(name, cfg):
+    """True running, False stopped, None missing."""
+    p = docker("inspect", "--format", "{{.State.Running}}", name, check=False, cfg=cfg)
+    return None if p.returncode else p.stdout.strip() == "true"
+
+
+def oc_start(cfg, P):
+    name = P["container"]
+    docker("rm", "-f", name, check=False, cfg=cfg)
+    if image_hash(cfg) != sandbox_hash(cfg):
+        build_image(cfg)
+    for key in ("dir", "ws", "fw"):
+        P[key].mkdir(parents=True, exist_ok=True)
+    (P["fw"] / "ready").unlink(missing_ok=True)
+    port, password = free_port(), secrets.token_urlsafe(32)
+    envf = P["dir"] / ".server.env"
+    fd = os.open(envf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"OPENCODE_SERVER_PASSWORD={password}\n")
+    try:
+        args = ["run", "-d", "--name", name, "--label", f"rsa.oc={P['inst']}", "--init",
+                "--hostname", "rsa-sandbox", "--log-opt", "max-size=5m",
+                "--cpus", str(cfg["cpus"]), "--memory", str(cfg["memory"]),
+                "--memory-swap", str(cfg["memory"]), "--pids-limit", str(cfg["pids_limit"]),
+                "--security-opt", "no-new-privileges", "-p", f"127.0.0.1:{port}:4096",
+                "-v", f"{P['ws']}:/ws", "-v", f"{P['fw']}:/rsa/fw:ro",
+                "-v", f"{P['volume']}:/root/.local/share/opencode", "--env-file", str(envf),
+                "-e", f"RSA_GIT_NAME={cfg['git_name']}", "-e", f"RSA_GIT_EMAIL={cfg['git_email']}"]
+        for ns in cfg["dns"] or []:
+            args += ["--dns", str(ns)]
+        if ENV_FILE.exists():
+            args += ["--env-file", str(ENV_FILE)]
+        docker(*args, cfg["image"], "server", cfg=cfg, timeout=120)
+    finally:
+        envf.unlink(missing_ok=True)
+    if cfg["block_private_network"]:
+        fw = docker("run", "--rm", "--network", f"container:{name}", "--cap-add", "NET_ADMIN",
+                    "--security-opt", "no-new-privileges", "-v", f"{P['fw']}:/rsa/fw",
+                    cfg["image"], "fw", check=False, cfg=cfg, timeout=60)
+        if fw.returncode != 0:
+            docker("rm", "-f", name, check=False, cfg=cfg)
+            raise RsaError(f"could not install the bridge server's firewall: {(fw.stdout + fw.stderr).strip()[-500:]}")
+    else:
+        (P["fw"] / "ready").touch()
+    version, deadline = None, time.time() + 90
+    while not version and time.time() < deadline:
+        if container_state(name, cfg) is not True:
+            logs = docker("logs", "--tail", "30", name, check=False, cfg=cfg)
+            raise RsaError(f"bridge server exited during startup: {(logs.stdout + logs.stderr).strip()[-800:]}")
+        version = oc_health(port, password, timeout=3) or time.sleep(1)
+    if not version:
+        raise RsaError("bridge server did not become healthy within 90s")
+    state = {"port": port, "password": password, "version": version,
+             "image_hash": sandbox_hash(cfg), "started_at": now_iso()}
+    write_json(P["state"], state)
+    os.chmod(P["state"], 0o600)
+    return state
+
+
+def cmd_oc_up(a):
+    cfg = load_config()
+    P = oc_paths(a.instance)
+    state = read_json(P["state"], {}) or {}
+    stale = state.get("image_hash") != sandbox_hash(cfg)
+    if (not a.restart and state.get("port") and container_state(P["container"], cfg)
+            and oc_health(state["port"], state["password"])):
+        emit({**state, "started": False, "stale": stale})
+        return
+    emit({**oc_start(cfg, P), "started": True, "stale": False})
+
+
+def cmd_oc_attach(a):
+    """Heartbeat for a connected bridge; ends when the bridge's SSH session closes."""
+    import select
+    P = oc_paths(a.instance)
+    P["dir"].mkdir(parents=True, exist_ok=True)
+    while True:
+        P["heartbeat"].touch()
+        ready, _, _ = select.select([sys.stdin], [], [], 30)
+        if ready and not os.read(sys.stdin.fileno(), 4096):
+            return
+
+
+def cmd_oc_down(a):
+    cfg = load_config()
+    P = oc_paths(a.instance)
+    docker("rm", "-f", P["container"], check=False, cfg=cfg)
+    P["state"].unlink(missing_ok=True)
+    emit({"instance": a.instance, "container": "removed", "note": "workspaces and sessions are kept"})
+
+
+def cmd_oc_status(a):
+    cfg = load_config()
+    P = oc_paths(a.instance)
+    state = read_json(P["state"], {}) or {}
+    running = container_state(P["container"], cfg)
+    hb = P["heartbeat"].stat().st_mtime if P["heartbeat"].exists() else None
+    ws = sorted(p.name for p in P["ws"].iterdir()) if P["ws"].exists() else []
+    emit({"instance": a.instance, "container": P["container"],
+          "state": {True: "running", False: "stopped", None: "missing"}[running],
+          "healthy": bool(running and state.get("port") and oc_health(state["port"], state["password"])),
+          "port": state.get("port"), "version": state.get("version"),
+          "stale_image": bool(state) and state.get("image_hash") != sandbox_hash(cfg),
+          "heartbeat_age_sec": int(time.time() - hb) if hb else None, "workspaces": ws})
+
+
+def repo_bundle(repo, sha, have=None):
+    """Bundle bytes carrying `sha` (minus what `have` already provides); b"" if nothing is new."""
+    import tempfile
+    tmpref = f"refs/rsa/xfer-{secrets.token_hex(4)}"
+    git(repo, "update-ref", tmpref, sha)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "x.bundle")
+            spec = [tmpref] + ([f"^{have}"] if have else [])
+            p = run(["git", "-C", str(repo), "bundle", "create", "-q", out, *spec], check=False)
+            if p.returncode != 0:
+                if "empty bundle" in (p.stderr + p.stdout):
+                    return b""
+                raise RsaError(f"git bundle failed: {p.stderr.strip()[-400:]}")
+            data = Path(out).read_bytes()
+    finally:
+        git(repo, "update-ref", "-d", tmpref, check=False)
+    return data
+
+
+def cmd_oc_ws(a):
+    """Workspace operations inside the bridge server (see sandbox/rsa-ws). The host sends each
+    workspace only its own repository's objects, as a bundle on the exec's stdin."""
+    cfg = load_config()
+    P = oc_paths(a.instance)
+    if not WSDIR_RE.match(a.dir or ""):
+        raise RsaError(f"invalid workspace name: {a.dir!r}")
+    if a.op in ("init", "reset", "export") and not SHA_RE.match(a.sha or ""):
+        raise RsaError("a full commit sha is required")
+    if a.have and not SHA_RE.match(a.have):
+        raise RsaError("--have must be a full commit sha")
+    if container_state(P["container"], cfg) is not True:
+        raise RsaError(f"bridge server {P['container']} is not running (start it with `rsa bridge start`)")
+
+    def exec_ws(args, stdin=b""):
+        return subprocess.run(["docker", "exec", "-i", "-e", f"RSA_GIT_NAME={cfg['git_name']}",
+                               "-e", f"RSA_GIT_EMAIL={cfg['git_email']}", P["container"], "rsa-ws", *args],
+                              input=stdin, capture_output=True, env=docker_env(cfg), timeout=900)
+
+    if a.op in ("init", "reset"):
+        repo = repo_path(a.repo)
+        if git(repo, "cat-file", "-e", f"{a.sha}^{{commit}}", check=False).returncode:
+            raise RsaError(f"commit {a.sha} is not in repo {a.repo}")
+        have = a.have if a.op == "reset" and a.have and             git(repo, "cat-file", "-e", f"{a.have}^{{commit}}", check=False).returncode == 0 else None
+        p = exec_ws([a.op, a.dir, a.sha], repo_bundle(repo, a.sha, have))
+        if p.returncode != 0 and have:  # the workspace lost objects it should have had: send everything
+            p = exec_ws([a.op, a.dir, a.sha], repo_bundle(repo, a.sha))
+    else:
+        p = exec_ws([a.op, a.dir] + ([a.sha] if a.op == "export" else []))
+    if p.returncode != 0:
+        raise RsaError(f"rsa-ws {a.op} failed: {p.stderr.decode('utf-8', 'replace').strip()[-800:]}")
+    if a.op == "export":
+        if len(p.stdout) > float(cfg["max_bundle_mb"]) * 1e6:
+            raise RsaError(f"workspace changes exceed max_bundle_mb={cfg['max_bundle_mb']}")
+        sys.stdout.buffer.write(p.stdout)
+        sys.stdout.flush()
+        return
+    emit({"instance": a.instance, "dir": a.dir, "path": f"/ws/{a.dir}", "op": a.op})
+
+
+def oc_gc(cfg):
+    """Stop bridge servers whose bridge has been gone for oc_idle_hours."""
+    stopped = []
+    for d in OC_ROOT.iterdir() if OC_ROOT.exists() else []:
+        if not INSTANCE_RE.match(d.name):
+            continue
+        P = oc_paths(d.name)
+        hb = P["heartbeat"]
+        idle = time.time() - (hb.stat().st_mtime if hb.exists() else 0)
+        if idle > float(cfg["oc_idle_hours"]) * 3600 and container_state(P["container"], cfg):
+            docker("rm", "-f", P["container"], check=False, cfg=cfg)
+            P["state"].unlink(missing_ok=True)
+            stopped.append(d.name)
+            print(f"gc: stopped idle bridge server {P['container']}", flush=True)
+    return stopped
 
 
 def cmd_doctor(a):
@@ -1106,6 +1332,12 @@ def cmd_doctor(a):
             states[s] = states.get(s, 0) + 1
     check("tasks", True, ", ".join(f"{k}: {v}" for k, v in sorted(states.items())) or "none")
     check("default model", True, cfg["default_model"])
+    for d in sorted(OC_ROOT.iterdir()) if OC_ROOT.exists() else []:
+        if INSTANCE_RE.match(d.name) and docker_ok:
+            P = oc_paths(d.name)
+            st = read_json(P["state"], {}) or {}
+            up = container_state(P["container"], cfg) and st.get("port") and oc_health(st["port"], st["password"])
+            check(f"bridge server {P['container']}", True, f"healthy, port {st['port']}" if up else "not running")
     emit({"ok": all(c["ok"] for c in checks), "version": VERSION, "home": str(RSA_HOME), "checks": checks})
 
 
@@ -1151,6 +1383,7 @@ def main():
     s.add_argument("action", choices=["list", "set", "unset"]); s.add_argument("key", nargs="?")
     s.set_defaults(fn=cmd_env)
     s = sub.add_parser("auth", help="run `opencode auth ...` against the sandbox credential store")
+    s.add_argument("--bridge", metavar="INSTANCE", help="use the T3 bridge server's credential store")
     s.add_argument("args", nargs=argparse.REMAINDER); s.set_defaults(fn=cmd_auth)
     s = sub.add_parser("models"); s.add_argument("args", nargs=argparse.REMAINDER); s.set_defaults(fn=cmd_models)
     s = sub.add_parser("shell", help="interactive shell in a throwaway sandbox"); s.set_defaults(fn=cmd_shell)
@@ -1158,6 +1391,19 @@ def main():
     s = sub.add_parser("doctor"); s.set_defaults(fn=cmd_doctor)
     s = sub.add_parser("gc"); s.set_defaults(fn=cmd_gc)
     s = sub.add_parser("version"); s.set_defaults(fn=cmd_version)
+
+    s = sub.add_parser("oc-up", help="(bridge) ensure the OpenCode server container is running")
+    s.add_argument("instance"); s.add_argument("--restart", action="store_true"); s.set_defaults(fn=cmd_oc_up)
+    s = sub.add_parser("oc-attach", help="(bridge) heartbeat while a bridge is connected")
+    s.add_argument("instance"); s.set_defaults(fn=cmd_oc_attach)
+    s = sub.add_parser("oc-down", help="(bridge) stop the OpenCode server container")
+    s.add_argument("instance"); s.set_defaults(fn=cmd_oc_down)
+    s = sub.add_parser("oc-status"); s.add_argument("instance"); s.set_defaults(fn=cmd_oc_status)
+    s = sub.add_parser("oc-ws", help="(bridge) workspace operations inside the server container")
+    s.add_argument("instance"); s.add_argument("op", choices=["init", "plain", "reset", "export", "remove"])
+    s.add_argument("dir"); s.add_argument("repo", nargs="?"); s.add_argument("sha", nargs="?")
+    s.add_argument("--have", help="(reset) commit the workspace already has; only newer objects are sent")
+    s.set_defaults(fn=cmd_oc_ws)
 
     a = p.parse_args()
     try:

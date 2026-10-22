@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Workspace operations for the T3 bridge, run by the host via `docker exec -i` inside an
+# rsa server container. Each workspace /ws/<dir> holds only its own repository's objects:
+# the host streams them in as git bundles on stdin (no host repository is mounted).
+#
+#   rsa-ws init   DIR SHA        create /ws/DIR with exactly the files of SHA (bundle on stdin)
+#   rsa-ws plain  DIR            create an empty /ws/DIR (thread directory is not a git repo)
+#   rsa-ws reset  DIR SHA        make /ws/DIR's files exactly SHA, keeping ignored files such as
+#                                node_modules (bundle with any missing objects on stdin, may be empty)
+#   rsa-ws export DIR BASE       write a git bundle of /ws/DIR's current files on top of BASE to
+#                                stdout; write nothing when the files still equal BASE
+#   rsa-ws remove DIR            delete /ws/DIR
+#
+# Git always runs with fsmonitor and hooks disabled. The agent controls /ws/DIR/.git, but this
+# runs inside the same sandbox with no more privileges than the agent already has.
+set -euo pipefail
+
+export GIT_AUTHOR_NAME=${RSA_GIT_NAME:-rsa-agent} GIT_AUTHOR_EMAIL=${RSA_GIT_EMAIL:-rsa-agent@localhost}
+export GIT_COMMITTER_NAME=$GIT_AUTHOR_NAME GIT_COMMITTER_EMAIL=$GIT_AUTHOR_EMAIL
+g() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c gc.auto=0 "$@"; }
+
+# Fetch a bundle from stdin (if any) into the workspace repository.
+fetch_stdin() {
+  local bundle
+  bundle=$(mktemp)
+  cat >"$bundle"
+  if [ -s "$bundle" ]; then
+    g fetch -q --no-tags "$bundle" "+refs/rsa/xfer-*:refs/rsa/in/*"
+  fi
+  rm -f "$bundle"
+}
+
+drop_incoming() {
+  g for-each-ref --format='%(refname)' refs/rsa/in/ | while read -r ref; do g update-ref -d "$ref"; done
+}
+
+cmd=$1
+dir="/ws/$2"
+case "$cmd" in
+  init)
+    sha=$3
+    rm -rf "$dir"
+    mkdir -p "$dir" && cd "$dir"
+    g init -q -b rsa-ws
+    printf '%s\n' node_modules/ .venv/ venv/ __pycache__/ '*.pyc' .pytest_cache/ .mypy_cache/ \
+      .ruff_cache/ .DS_Store >>.git/info/exclude
+    fetch_stdin
+    g reset -q --hard "$sha"
+    g clean -fdq
+    drop_incoming
+    ;;
+  plain)
+    mkdir -p "$dir"
+    ;;
+  reset)
+    sha=$3
+    cd "$dir"
+    fetch_stdin
+    g reset -q --hard "$sha"
+    g clean -fdq
+    drop_incoming
+    ;;
+  export)
+    base=$3
+    cd "$dir"
+    idx=$(mktemp) bundle=$(mktemp)
+    trap 'rm -f "$idx" "$bundle"' EXIT
+    GIT_INDEX_FILE=$idx g read-tree "$base"
+    GIT_INDEX_FILE=$idx rsa-ignore-build-trees || echo "rsa-ws: could not check for CMake build trees" >&2
+    GIT_INDEX_FILE=$idx g add -A . >/dev/null 2>&1
+    tree=$(GIT_INDEX_FILE=$idx g write-tree)
+    [ "$tree" = "$(g rev-parse "$base^{tree}")" ] && exit 0
+    commit=$(g commit-tree "$tree" -p "$base" -m "rsa: sandbox changes")
+    g update-ref refs/rsa/ws "$commit"
+    g bundle create -q "$bundle" refs/rsa/ws "^$base"
+    cat "$bundle"
+    ;;
+  remove)
+    rm -rf "$dir"
+    ;;
+  *)
+    echo "usage: rsa-ws init|plain|reset|export|remove DIR ..." >&2
+    exit 64
+    ;;
+esac

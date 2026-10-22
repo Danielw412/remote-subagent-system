@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "instructions": ["/etc/rsa/reverse-engineering.md"],
+  "instructions": ["/etc/rsa/reverse-engineering.md", "/etc/rsa/cmake.md"],
   "mcp": {
     "servers": {
       "rea": {

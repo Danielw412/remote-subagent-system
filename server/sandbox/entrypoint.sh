@@ -5,10 +5,16 @@
 #   rsa-entrypoint shell            interactive shell, for troubleshooting
 #   rsa-entrypoint opencode ARGS    run the opencode CLI (auth, models, ...)
 #   rsa-entrypoint selftest         verify the sandbox's isolation guarantees
+#   rsa-entrypoint server           long-running `opencode serve` for the T3 bridge
+#   rsa-entrypoint fw               (helper) firewall another container's network namespace
 #
 # Stage 1 installs the egress firewall while the container still holds NET_ADMIN,
 # then re-executes this script with NET_ADMIN removed from the capability bounding
 # set, so nothing the agent runs can change or remove the rules.
+#
+# Server containers never hold NET_ADMIN at all: `docker exec` sessions get the
+# container's full capability set, so the rules are installed from outside by a
+# one-shot `fw` helper that joins the server's network namespace.
 set -uo pipefail
 
 OUT=/rsa/out
@@ -21,6 +27,8 @@ BLOCKED_V6="fc00::/7 fe80::/10"
 
 install_firewall() {
   local ns net
+  # Replies on connections opened from outside (the server's published port) stay allowed.
+  iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
   # Keep DNS working when the configured resolver itself sits on a private network.
   for ns in $(awk '/^nameserver/ {print $2}' /etc/resolv.conf); do
     case "$ns" in *:*) continue ;; esac
@@ -37,6 +45,24 @@ install_firewall() {
     fi
   done
 }
+
+case "${1:-}" in
+  fw)
+    install_firewall || { log "ERROR: could not install the egress firewall"; exit 70; }
+    touch /rsa/fw/ready
+    log "egress firewall installed in the server's network namespace"
+    exit 0
+    ;;
+  server)
+    # The fw helper signals through a host directory mounted read-only here.
+    for _ in $(seq 1 60); do [ -e /rsa/fw/ready ] && break; sleep 1; done
+    [ -e /rsa/fw/ready ] || { log "ERROR: egress firewall not confirmed; refusing to start"; exit 70; }
+    cp /etc/rsa/opencode-server.json /root/.config/opencode/opencode.json
+    mkdir -p /ws && cd /ws
+    log "starting opencode server for the T3 bridge"
+    exec opencode serve --hostname 0.0.0.0 --port 4096
+    ;;
+esac
 
 if [ "${1:-}" != "--stage2" ]; then
   if [ "${1:-task}" = task ]; then
@@ -75,6 +101,8 @@ case "$MODE" in
     check "git available" "git --version"
     check "Ghidra and REA analyze a native fixture over MCP" \
       "python3 /etc/rsa/reverse-engineering-selftest.py"
+    check "CMake builds and tests a C++ fixture; build trees stay out of results" \
+      "bash /etc/rsa/cmake-selftest.sh"
     exit $rc
     ;;
   *) log "unknown mode: $MODE"; exit 64 ;;
@@ -150,6 +178,7 @@ log "opencode exited with code $OC_EXIT after $((SECONDS - started))s$([ "$TIMED
 # imports the bundle as plain data and never runs git inside this workspace.
 STAGE=finalize
 cd /workspace 2>/dev/null || fail "workspace disappeared"
+rsa-ignore-build-trees || log "warning: could not check for CMake build trees"
 git add -A . >/dev/null 2>&1 || log "warning: git add failed"
 if ! git diff --cached --quiet 2>/dev/null; then
   git -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -q --no-verify \
