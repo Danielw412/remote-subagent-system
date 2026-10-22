@@ -53,3 +53,22 @@ with `-m <model>`) or submit a clearer prompt. `rsa cancel <id>` stops a queued 
 - Never put secrets in prompts. Sandboxes have no access to the user's credentials beyond the
   model provider keys configured on the server.
 - One worker runs tasks one at a time (FIFO). Prefer a few well-scoped tasks over many tiny ones.
+
+## Reverse engineering inside the sandbox
+
+- Both paths include Ghidra 12.1.4, JDK 21, and Reverse Engineer Anything (REA)
+  6.7.0, with a local `rea` MCP server and the matching `reverse-engineer-anything`
+  skill. Agents can also call `rea` or Ghidra's `analyzeHeadless` from the shell.
+- Include the exact artifact path, investigation questions, requested reports,
+  and whether runtime execution is needed in the task. For native analysis ask
+  for `provider_id: "ghidra"`; for JavaScript/Electron/ASAR use REA's static
+  application analysis. Normal source-repository questions do not require REA.
+- Supply artifacts in the synced checkout, a committed queue input (or `--dirty`
+  snapshot), or an authorized public download. The sandbox cannot read Windows
+  applications or reach host/private services. Optional engines such as IDA,
+  Hopper, JADX, browser runtimes, and firmware tools are not installed.
+- Ask the child to read its installed REA skill, cite Evidence IDs, distinguish
+  observations from inferences, keep databases/caches in `/tmp`, and return only
+  requested reports or deliverables. The default Ghidra Java heap is 2 GiB and
+  shares the container's memory limit. Static analysis does not require executing
+  target binaries. Existing T3 permissions and sandbox isolation still apply.

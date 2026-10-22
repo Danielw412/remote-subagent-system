@@ -73,6 +73,8 @@ case "$MODE" in
     check "DNS resolves github.com" "getent hosts github.com"
     check "opencode runs ($(opencode --version 2>/dev/null))" "opencode --version"
     check "git available" "git --version"
+    check "Ghidra and REA analyze a native fixture over MCP" \
+      "python3 /etc/rsa/reverse-engineering-selftest.py"
     exit $rc
     ;;
   *) log "unknown mode: $MODE"; exit 64 ;;

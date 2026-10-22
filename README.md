@@ -205,6 +205,49 @@ Residual risks you should know about:
 | worker gone after logout/reboot | needs lingering: `sudo loginctl enable-linger daniel` (already enabled here) |
 | want a clean slate | `rsa server stop`, then on the server `rm -rf ~/.rsa/tasks/* ~/.rsa/queue/*`, then `rsa server start` |
 
+## Reverse engineering tools
+
+Every sandbox includes [Ghidra 12.1.4](https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.4_build),
+a full JDK 21, and [Reverse Engineer Anything (REA) 6.7.0](https://github.com/morluto/rea).
+REA is pinned to its supported Ghidra 12.1 series. The Ghidra release ZIP is checked
+against its SHA-256 during the image build; no tools are downloaded at agent startup.
+
+Queue tasks and T3 bridge sessions both load the local `rea` MCP server and its
+matching `reverse-engineer-anything` skill. The additive config at
+`/etc/rsa/reverse-engineering.json` supplies tools and instructions without changing
+their permission rules. Agents can use native decompilation, disassembly, strings,
+and cross-references, plus REA's built-in static JavaScript/Electron/ASAR and artifact
+inspection. Optional engines (IDA, Hopper, JADX, firmware tools, browser runtimes)
+are not included. Only the capabilities reported by the installed REA are available.
+
+Supply target artifacts inside the repository (use `rsa submit --dirty` for
+uncommitted files), or an authorized public download URL. Windows installations
+and host applications are not mounted into the sandbox. Ask agents to keep analysis
+databases in `/tmp` and return requested reports in the checkout. For example:
+
+```text
+Analyze artifacts/sample.elf with REA's Ghidra provider. Find the input validation
+function, explain it with Evidence IDs and pseudocode, and write findings.md.
+Keep analysis databases outside the checkout; do not execute the target binary.
+```
+
+The CLI is also available as `rea`; direct Ghidra scripts can use `analyzeHeadless`.
+`GHIDRA_INSTALL_DIR=/opt/ghidra`, `JAVA_HOME=/opt/java/openjdk`, and a default
+`GHIDRA_HEADLESS_MAXMEM=2G` are configured. The Java heap shares the sandbox's total
+memory budget with OpenCode, REA, and other processes; large targets may need a
+larger container memory limit or a smaller analysis scope.
+
+Update existing installations with `rsa server install`, then
+`rsa bridge restart --remote` when the bridge has no active turns. New queue tasks
+use the rebuilt image automatically. `rsa server selftest` now compiles a small
+native fixture and verifies Ghidra pseudocode and JavaScript evidence over REA MCP,
+in addition to the isolation checks. This test does not execute the native fixture
+or require a model. For the tool test alone inside a sandbox:
+
+```bash
+python3 /etc/rsa/reverse-engineering-selftest.py
+```
+
 ## Limitations
 
 - Agents see committed state (or a `--dirty` snapshot). Git submodules are not populated, and
