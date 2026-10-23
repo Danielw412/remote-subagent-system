@@ -839,13 +839,9 @@ def cmd_run(a):
     return 0
 
 
-def cmd_start(a):
-    st = running_status()
-    if st:
-        print(f"bridge already running (pid {st['pid']}, upstream {st['upstream']})")
-        return 0
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    args = [sys.executable, str(Path(core.__file__).resolve()), "bridge", "run"]
+def spawn_detached(rsa_args):
+    """Run `rsa <rsa_args>` in the background, detached from this console and its job object."""
+    args = [sys.executable, str(Path(core.__file__).resolve()), *rsa_args]
     kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
         base = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
@@ -855,6 +851,15 @@ def cmd_start(a):
             subprocess.Popen(args, creationflags=base, **kw)
     else:
         subprocess.Popen(args, start_new_session=True, **kw)
+
+
+def cmd_start(a):
+    st = running_status()
+    if st:
+        print(f"bridge already running (pid {st['pid']}, upstream {st['upstream']})")
+        return 0
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    spawn_detached(["bridge", "run"])
     for _ in range(40):
         time.sleep(0.5)
         st = running_status()
@@ -976,10 +981,11 @@ def cmd_t3_install(a):
     return 0
 
 
-def cmd_autostart(a):
+def set_autostart(name, rsa_args, on):
+    """Startup-folder entry that runs `rsa <rsa_args>` hidden at Windows logon."""
     startup = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-    target = startup / "rsa-bridge.vbs"
-    if a.state == "off":
+    target = startup / f"{name}.vbs"
+    if not on:
         target.unlink(missing_ok=True)
         print("autostart disabled")
         return 0
@@ -987,10 +993,14 @@ def cmd_autostart(a):
         raise core.RsaError(f"Startup folder not found: {startup}")
     py = Path(sys.executable)
     target.write_text('Set sh = CreateObject("WScript.Shell")\r\n'
-                      f'sh.Run """{py}"" ""{Path(core.__file__).resolve()}"" bridge start", 0, False\r\n',
+                      f'sh.Run """{py}"" ""{Path(core.__file__).resolve()}"" {" ".join(rsa_args)}", 0, False\r\n',
                       encoding="utf-8")
     print(f"autostart enabled: {target}")
     return 0
+
+
+def cmd_autostart(a):
+    return set_autostart("rsa-bridge", ["bridge", "start"], a.state == "on")
 
 
 def cmd_forget(a):

@@ -28,7 +28,8 @@ HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent
 CONFIG_PATH = Path.home() / ".config" / "rsa" / "config.json"
 DEFAULTS = {"host": "linuxbox", "remote": "~/.rsa/app/rsa-server", "ssh": "ssh",
-            "bridge_port": "47960", "bridge_instance": "default", "bridge_password": ""}
+            "bridge_port": "47960", "bridge_instance": "default", "bridge_password": "",
+            "dispatch_port": "47961"}
 ENV_OVERRIDES = {"host": "RSA_HOST", "remote": "RSA_REMOTE", "ssh": "RSA_SSH"}
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
@@ -519,9 +520,8 @@ def cmd_doctor(a):
     for c in rep["checks"]:
         line(c["ok"], c["name"], c["detail"])
     print("T3 bridge:")
-    sys.path.insert(0, str(HERE))
-    import rsa_bridge
-    rsa_bridge.core = sys.modules[__name__]
+    rsa_dispatch = local_modules()
+    rsa_bridge = rsa_dispatch.bridge
     st = rsa_bridge.running_status()
     line(bool(st and st.get("upstream") == "connected"), "bridge", (
         f"running on {rsa_bridge.bridge_url()}, sandbox server {st['upstream']}" if st else
@@ -534,6 +534,16 @@ def cmd_doctor(a):
              entry.get("displayName", "?") if entry else "missing (`rsa bridge t3-install`)")
     except (OSError, ValueError):
         print("  [info] T3 Code settings not found (T3 integration not set up on this machine)")
+    print("Full Access dispatch:")
+    ds = rsa_dispatch.running()
+    if not ds:
+        print("  [info] rsa dispatch not running (optional; see README \"Full Access dispatch\")")
+    else:
+        au, po = ds["authorization"], ds["policy"]
+        line(au["authorized"], "T3 authorization", f"{au['access']}, {au['days_left']} days left" if au["authorized"]
+             else "missing or expired (`rsa dispatch authorize`)")
+        line(not po["integrity_error"], "dispatch policy", po["integrity_error"] or
+             f"{'enabled' if po['enabled'] else 'disabled'}, profiles: {', '.join(po['profiles']) or 'none'}")
     print("\nall checks passed" if ok else "\nsome checks failed (see README troubleshooting)")
     return 0 if ok else EXIT_FAILED
 
@@ -606,10 +616,25 @@ def cmd_server(a):
     return passthrough([act, *rest], tty=tty)
 
 
-def cmd_bridge(a):
-    sys.path.insert(0, str(HERE))
+def local_modules():
+    """rsa_bridge and rsa_dispatch, wired to this module (returns rsa_dispatch; .bridge is rsa_bridge)."""
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
     import rsa_bridge
-    return rsa_bridge.main(a, sys.modules[__name__])
+    import rsa_dispatch
+    rsa_bridge.core = rsa_dispatch.core = sys.modules[__name__]
+    rsa_dispatch.bridge = rsa_bridge
+    return rsa_dispatch
+
+
+def cmd_bridge(a):
+    rsa_dispatch = local_modules()
+    return rsa_dispatch.bridge.main(a, sys.modules[__name__])
+
+
+def cmd_dispatch(a):
+    rsa_dispatch = local_modules()
+    return rsa_dispatch.main(a, sys.modules[__name__], rsa_dispatch.bridge)
 
 
 def cmd_install(a):
@@ -722,6 +747,7 @@ def main():
     b.add_argument("dir", nargs="?"); b.add_argument("--all", action="store_true")
     b.add_argument("--missing", action="store_true", help="workspaces whose Windows directory no longer exists")
     s.set_defaults(fn=cmd_bridge)
+    local_modules().add_parser(sub).set_defaults(fn=cmd_dispatch)
 
     a = p.parse_args()
     if a.cmd == "status" and a.id and not ID_RE.match(a.id):

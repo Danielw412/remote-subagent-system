@@ -7,7 +7,7 @@ setup and operations, see `README.md`.
 ## What this is
 
 `rsa` runs OpenCode agents in rootless Docker sandboxes on a Linux host (`latitude7370`), driven
-from a Windows machine over SSH and Tailscale. It has two parts:
+from a Windows machine over SSH and Tailscale. It has three parts:
 
 - **Headless queue:** `rsa submit` → `rsa-worker.service` → one disposable container per task. Results
   come back as git bundles, landing in `refs/rsa/<id>`.
@@ -15,6 +15,10 @@ from a Windows machine over SSH and Tailscale. It has two parts:
   external OpenCode server (provider instance `opencode_linux`). It forwards the OpenCode v2 API to a
   long-lived sandbox container (`rsa-oc-<instance>`), maps Windows paths to `/ws/...`, and syncs files
   around each turn.
+- **Full Access dispatch:** `client/rsa_dispatch.py` is a local daemon (127.0.0.1:47961) that the user
+  authorizes in T3 through T3's outside-agent MCP sign-in. Within user-approved profiles, it starts
+  top-level `opencode_linux` threads in Full Access for orchestrators that run in Auto mode
+  (`rsa dispatch submit|wait|send|cancel|result`).
 
 ## Layout
 
@@ -22,6 +26,7 @@ from a Windows machine over SSH and Tailscale. It has two parts:
 |---|---|---|
 | `client/rsa.py` | Windows (any OS) | CLI: task commands, `rsa server ...` passthrough over SSH, `rsa install` |
 | `client/rsa_bridge.py` | Windows | `rsa bridge ...`: HTTP proxy, SSH tunnel, path mapping, workspace sync |
+| `client/rsa_dispatch.py` | Windows | `rsa dispatch ...`: T3 MCP/OAuth client, DPAPI vault, signed policy and jobs, local API, CLI |
 | `server/rsa-server` | Linux host | queue, worker, admin CLI, `oc-*` commands for bridge servers |
 | `server/rsa-worker.service` | Linux host | systemd user unit for the worker |
 | `server/sandbox/Dockerfile` | image | `rsa-sandbox:latest` (node 22 + git/python/build tools + `@opencode/cli`) |
@@ -31,7 +36,7 @@ from a Windows machine over SSH and Tailscale. It has two parts:
 | `server/sandbox/rsa-ignore-build-trees` | container | excludes untracked CMake build trees before results are harvested |
 | `server/sandbox/cmake.md`, `cmake-selftest.sh` | container | agent instructions for CMake builds; their selftest |
 | `skill/remote-agents/SKILL.md` | agents | installed into `~/.claude/skills` and `~/.codex/skills` |
-| `tests/` | Windows | `bridge_apply_test.py` (offline); `e2e.py` and `bridge_api_test.py` (live) |
+| `tests/` | Windows | `bridge_apply_test.py`, `dispatch_test.py` (offline); `e2e.py`, `bridge_api_test.py`, `dispatch_live_test.py` (live) |
 
 ## Hard rules
 
@@ -76,6 +81,18 @@ Treat everything produced inside a sandbox as hostile: files, `.git`, bundles, A
    container (inherent to OpenCode). Don't add more.
 8. **Egress:** sandboxes reach the public internet only. LAN, `100.64/10` (Tailscale), and link-local are
    blocked. Replies on inbound connections are allowed via conntrack `ESTABLISHED,RELATED`.
+9. **Dispatcher (`rsa_dispatch.py`):**
+   - **The T3 credential.** It comes only from the user's own approval on T3's OAuth page; never
+     reuse, read, or extract an agent's T3 credentials. It lives in daemon memory and in the DPAPI
+     vault. It must never appear in output, logs, command lines, API replies, or the Linux side, and
+     it is sent only to T3's loopback `/mcp` after checking the environment id.
+   - **Default deny.** Policy is checked in code. Granting more (profiles, `enable`, raised limits,
+     `--ask` exceptions) needs the native dialog (`confirm()`), never a flag or an API call.
+     `policy.json` and `jobs.json` stay HMAC-signed; a bad signature fails closed.
+   - **Sandbox providers only.** Dispatched threads only run on provider instances whose
+     `serverUrl` is the rsa bridge; re-check the launched thread. Never add generic T3 tool
+     pass-through (`T3_TOOLS` is the allowlist), and only act on threads in the signed job registry.
+   - **No auto-merge.** Each job gets its own new worktree.
 
 ## Making changes take effect
 
@@ -83,6 +100,7 @@ Treat everything produced inside a sandbox as hostile: files, `.git`, bundles, A
 |---|---|
 | `client/rsa.py` | nothing (shims point at this checkout) |
 | `client/rsa_bridge.py` | `rsa bridge restart` |
+| `client/rsa_dispatch.py` | `rsa dispatch restart` (running jobs re-attach; the CLI side needs nothing) |
 | `server/rsa-server`, `rsa-worker.service` | `rsa server install` (re-deploys and restarts the worker; running tasks re-attach) |
 | anything in `server/sandbox/` | `rsa server install` (rebuilds the image when its hash changes), then `rsa bridge restart --remote` to recreate the bridge server container |
 | sandbox workspace format (`rsa-ws`, mounts) | also `rsa bridge stop; rsa bridge forget --all; rsa bridge restart --remote`. Workspaces re-provision on next use. |
@@ -94,8 +112,10 @@ Run what matches your change. Live tests use the real server, free OpenCode mode
 repos in `%TEMP%` that they clean up.
 
 ```powershell
-python -I -m py_compile client\rsa.py client\rsa_bridge.py      # syntax (rsa-server: python -c "import ast; ...")
+python -I -m py_compile client\rsa.py client\rsa_bridge.py client\rsa_dispatch.py   # syntax (rsa-server: python -c "import ast; ...")
 python tests\bridge_apply_test.py          # offline, ~5 s: write-back hardening (8.3 aliases, hooks, .git, CRLF, conflicts)
+python tests\dispatch_test.py              # offline, ~30 s: dispatcher policy, sign-in, integrity, recovery (fake T3)
+python tests\dispatch_live_test.py --profile NAME   # live, ~3 min: needs the user's `rsa dispatch authorize` + profile
 rsa server selftest                         # sandbox isolation (firewall, caps, DNS)
 python tests\bridge_api_test.py            # bridge, needs `rsa bridge start`; ~2 min
 python tests\e2e.py                         # headless queue core, ~3 min
@@ -109,6 +129,9 @@ rsa doctor                                  # end-to-end health incl. bridge and
   inside a T3 thread (`delegate_task` to `opencode_linux`). An Auto-mode thread cannot create T3
   projects or Full Access children. Use `runtimeMode: "auto-accept-edits"` with file-only tasks,
   and clean up any test files it writes.
+- **The dispatcher's authorization and profile approvals are the user's.** Never complete T3's sign-in
+  yourself (for example with `t3 auth pairing create`), never click or script the confirmation
+  dialog, and never sign policy files by hand. Ask the user to approve, then run the live test.
 - When debugging the bridge, start it with `RSA_BRIDGE_TRACE=1` to log every request; see `rsa bridge logs`.
 
 ## Conventions
@@ -118,7 +141,8 @@ rsa doctor                                  # end-to-end health incl. bridge and
   - Machine-facing `rsa-server` commands print one JSON document. Failures print
     `{"ok": false, "error": ...}` and exit 2.
   - `oc-ws export` is the exception: raw bundle bytes on stdout.
-  - Client exit codes: 0 ok/succeeded, 1 task failed, 2 error, 3 still running. Keep `--json` output stable.
+  - Client exit codes: 0 ok/succeeded, 1 task failed, 2 error, 3 still running; `rsa dispatch` adds
+    4 for denied by policy (nothing started). Keep `--json` output stable.
 - Remote calls go through `call()` / `remote_bytes()` with validated arguments. Free text (prompts)
   travels as JSON on stdin, never in the SSH command line.
 - **Windows specifics:**
@@ -142,3 +166,18 @@ Re-verify these if either is upgraded:
   which is why the bridge holds that event until write-back completes.
 - **Permissions.** T3 sends per-session permission rules: Full Access is allow-all, anything else
   `ask`s for shell and edit. Children can never exceed the parent's mode.
+
+## Facts the dispatcher depends on (T3 Code 0.1.2)
+
+- **Outside-agent MCP.** T3 serves MCP (streamable HTTP, `Mcp-Session-Id`) at `<origin>/mcp`; the
+  origin is in `~/.t3/userdata/server-runtime.json`.
+- **OAuth.** Discovery is at `/.well-known/oauth-authorization-server`. Registration is dynamic
+  (JSON), and loopback redirects are matched by host and path, not port. PKCE S256 is required.
+  The token request is form-encoded; there is no refresh token, and the TTL is 30 days.
+- **Access.** The approval page offers `read-only`, `approval-required`, `auto-accept-edits`,
+  `auto`, and `full-access`. Only `full-access` grants the `settings:write` scope. The token is
+  accepted at `/mcp` only.
+- **Launching.** `t3_thread_launch` takes `runtimeMode`, `modelSelection`, and `workspaceStrategy`.
+  Modes above the session's ceiling fail with `runtime_mode_escalation_denied`. Tool failures come
+  back as `isError` with JSON `{code, message}`. Thread ids look like `mcp:<uuid>`, and links are
+  `t3-thread://v1/<threadId>` (not URL-encoded).
