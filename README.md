@@ -8,6 +8,10 @@ rootless Docker sandbox on a Linux server, connected over Tailscale. There are t
   `delegate_task` children show messages, tool calls, approvals, and diffs in T3, and can be
   interrupted, continued, and reviewed like any other T3 thread. See
   [T3 Code integration](#t3-code-integration).
+- **Full Access dispatch**, with `rsa dispatch`: an orchestrator in T3's Auto mode starts
+  unattended worker threads in T3 on that provider. The workers run in Full Access, but only
+  within profiles that you approved, and through a dispatcher that you authorized in T3 yourself.
+  See [Full Access dispatch](#full-access-dispatch).
 - **Headless**, with `rsa submit`: an unattended queue whose results come back as git refs (described below).
 
 ```
@@ -59,7 +63,13 @@ rsa server install
 # 3. Verify everything
 rsa doctor
 rsa server selftest       # proves the sandbox cannot reach the LAN, the tailnet or this host
+
+# 4. Optional: T3 integration (below), then Full Access dispatch for Auto-mode orchestrators
+rsa dispatch start; rsa dispatch autostart on; rsa dispatch authorize; rsa dispatch profile add ...
 ```
+
+**Updating:** after `git pull`, re-run `python client\rsa.py install --skills` (skill), `rsa server
+install` (server side), `rsa bridge restart`, and `rsa dispatch restart`.
 
 The client defaults to SSH host `linuxbox`. Change it with `rsa config host <alias>` or the `RSA_HOST` env var.
 
@@ -115,7 +125,7 @@ rsa bridge restart --remote              # the sandbox server reads keys when it
   broader permissions than its parent. A child of an **Auto** orchestrator therefore asks you to
   approve shell commands and edits in the child thread. `runtimeMode: "auto-accept-edits"` lets
   file-only work run without approvals. For fully unattended shell work from an Auto orchestrator,
-  use `rsa submit`.
+  use [`rsa dispatch`](#full-access-dispatch) (visible T3 threads, your profiles) or `rsa submit` (headless).
 - **Monitor, interrupt, interact, and reconnect:** use T3 as usual (stop button, follow-up messages,
   `task_cancel`, `t3_thread_send`). Sessions live in the sandbox server and survive restarts of
   T3 and of the bridge; on reconnect, the bridge brings back changes made while it was away.
@@ -206,6 +216,182 @@ interactively with `rsa server auth login`. Alternatively, log in with OpenCode 
 is available and copy the credentials over:
 `opencode auth export | ssh linuxbox ~/.rsa/app/rsa-server auth import`.
 
+## Full Access dispatch
+
+T3 never lets a thread start another thread with broader permissions than its own. An orchestrator
+(Codex, Claude Code) in **Auto** mode therefore cannot start an unattended worker: its
+`delegate_task` children ask you to approve every shell command. `rsa dispatch` is a separate,
+small local service (`client/rsa_dispatch.py`) that **you** authorize instead:
+
+- It connects to T3 through T3's documented **outside-agent MCP connection**: the `/mcp` endpoint
+  with OAuth sign-in, the same mechanism as "Copy MCP URL" in Settings → Connections. You approve
+  it on T3's own page and choose **Full access** there. It does not use, read, or extract any
+  agent's T3 credentials.
+- You approve **profiles**: a repository (a T3 project), the sandbox provider, the allowed models,
+  the runtime mode, and limits. Within a profile, `rsa dispatch submit` starts an ordinary
+  **top-level T3 thread** on `opencode_linux` in Full Access, in a **new git worktree**, without
+  asking you again. It returns the thread id and a clickable `t3-thread://` link. Anything outside
+  a profile is refused, or waits for your click in a Windows dialog. The dispatcher enforces this
+  in code; nothing depends on the prompt.
+- Workers are normal T3 threads. Progress, tool calls, diffs, checkpoints, follow-ups, stop, and
+  reconnection behave exactly as for any `opencode_linux` thread, using the same bridge and file
+  sync. Changes stay in the worker's worktree. **Nothing is merged automatically.**
+
+```
+ Orchestrator (Auto mode)       rsa dispatch (daemon, 127.0.0.1:47961)            T3 Code            rsa bridge -> sandbox
+ rsa dispatch submit ...  ───▶  client key auth; profile + limits check   ──MCP──▶ t3_thread_launch ──▶ opencode_linux thread,
+   (never holds the T3 token)   T3 token in memory + DPAPI vault          OAuth    (full-access ceiling   Full Access, new worktree
+ rsa dispatch wait/send/...     signed policy/jobs, dialogs for exceptions token    set by the user)    (unattended, sandbox only)
+```
+
+### Setup (once, by you)
+
+```powershell
+rsa dispatch start                  # the local dispatcher (Windows; keeps its state in ~\.rsa\dispatch)
+rsa dispatch autostart on           # start it at logon (recommended: then it never runs inside an agent's sandbox)
+rsa dispatch authorize              # opens T3's sign-in page: choose "Full access" and approve
+rsa dispatch profile add myrepo --repo C:\path\to\repo --model opencode/deepseek-v4.1-flash-free
+                                    # a dialog shows exactly what you grant: click OK
+rsa dispatch status                 # authorization (expiry), policy, bridge, running jobs
+```
+
+- `authorize`: if T3 asks for a **pairing code**, create one in T3 Settings → Connections (or
+  `t3 auth pairing create`). The credential lasts **30 days**. T3 has no refresh tokens, so run
+  `authorize` again before it expires (`rsa dispatch status` and `rsa doctor` show the days left).
+  `rsa dispatch deauthorize` deletes the local credential; revoke the session in T3 too
+  (Settings → Connections, or `t3 auth session list` / `t3 auth session revoke <id>`).
+- The repository must already be a T3 project (add it in T3, or `t3 project add <path>`), and the
+  bridge must be set up ([T3 Code integration](#t3-code-integration)).
+- Profile options (defaults in brackets): `--model` (repeat; globs like `opencode/*` allowed),
+  `--default-model` [the first concrete model], `--provider` [`opencode_linux`], `--mode`
+  [`full-access`; or `auto-accept-edits`/`auto`/`approval-required` for workers that ask you],
+  `--max-concurrent` [1], `--max-runtime-minutes` [60 per turn], `--max-followups` [10 per job],
+  `--max-jobs-per-day` [20]. `profile add` with an existing name replaces that profile.
+  `rsa dispatch profiles` lists them.
+- Global: `rsa dispatch limits --max-concurrent N` [2 running jobs in total]. `rsa dispatch disable`
+  stops all new dispatching at once; `enable` turns it back on.
+- **What needs your click:** anything that grants more (adding/replacing a profile, raising the
+  global limit, `enable`, and one-off `--ask` exceptions). Tightening (`profile remove`,
+  `disable`, lowering limits, `deauthorize`) applies immediately. The dialog comes from the
+  dispatcher process. Only **OK** approves; Cancel, closing it, or 5 minutes without an answer deny.
+
+### Use (orchestrators, or you)
+
+```powershell
+rsa dispatch profiles --json                      # what is approved
+rsa dispatch submit -f task.md --title "Add retry" --requester "<orchestrator>" --key <unique> --json
+rsa dispatch wait <job> --timeout 600 --json      # 0 completed, 1 failed/interrupted/cancelled, 3 still running
+rsa dispatch status <job> --json                  # T3 status, worktree, branch, link, last message, needs_user
+rsa dispatch send <job> -f followup.md --json     # follow-up in the same thread (queued if busy)
+rsa dispatch cancel <job>                         # interrupt; the job takes no further messages
+rsa dispatch result <job>                         # final message + files changed in the worktree (uncommitted)
+rsa dispatch list [--all]
+```
+
+- **Exit 4** means *denied by policy*, and nothing was started. With `--json`, the reply is
+  `{"code": "denied", "violations": [...]}`. Agents should check `code`: `powershell -Command`
+  wrappers turn any non-zero exit code into 1. `--ask` asks you once, in the dialog, instead of failing outright: for a model
+  outside the profile, a full concurrency, follow-up or daily limit. Requests for unknown
+  repositories, a non-sandbox provider, a disabled dispatcher, or an expired authorization are
+  always refused.
+- Workers start from a **committed** branch: by default the submitter's current branch when it is
+  in the same repository, otherwise the profile checkout's branch. Uncommitted changes are not
+  sent. Each job gets the branch `rsa-dispatch/<job>` and a T3 worktree. Review with T3's diff
+  panel or `git -C <worktree> diff`, then commit and merge yourself. Delete finished threads in T3
+  to remove their worktrees (T3's storage cleanup settings apply).
+- **Duplicates:** `--key` makes submissions (and `send` messages) idempotent. Without a key, an
+  identical request while the same job is still running returns that job. If T3's reply to a
+  launch is lost, the dispatcher finds the thread by the job id in its title instead of
+  launching twice.
+- **Restarts:** jobs are recorded in `~\.rsa\dispatch\jobs.json`. After a dispatcher restart (or
+  T3/bridge restarts) it re-attaches and keeps monitoring. Turns longer than
+  `max_runtime_minutes` are interrupted.
+- The Auto orchestrator's **own** T3 tools can read these threads, but cannot message or stop them.
+  T3 refuses with `runtime_mode_escalation_denied`, because the threads run in a broader mode.
+
+### Security model and limitations
+
+What is enforced, and where:
+
+| Rule | Enforced by |
+|---|---|
+| Dispatched threads never exceed the access you chose on T3's sign-in page | T3 (session ceiling) |
+| Default deny; repository, models, mode, and limits from your profiles | dispatcher |
+| Workers only run on a T3 provider instance whose `serverUrl` is the rsa bridge (the Linux sandbox). Host providers such as `claudeAgent` or `codex` are refused whatever a profile says. The launched thread is re-checked, and interrupted if T3 put it elsewhere | dispatcher (hard rule) |
+| Only threads the dispatcher started can be messaged or interrupted through it; it never merges | dispatcher |
+| It calls a fixed list of 7 T3 tools; there is no pass-through to other T3 tools or to shell commands | dispatcher |
+| Workers execute only inside the sandbox: egress firewall, no `NET_ADMIN`, rootless Docker | sandbox (unchanged) |
+| Agent files come back only through the bridge's write-back (never `.git` or hooks; your local edits win) | bridge (unchanged) |
+
+Credentials:
+
+- **T3 credential:** held in the dispatcher's memory, and at rest in `~\.rsa\dispatch\vault.bin`,
+  encrypted with Windows DPAPI for your account. It is never printed, logged, returned by any
+  command, or put on a command line. It is sent only to T3's loopback `/mcp`, after checking T3's
+  environment id. The `rsa dispatch` CLI that orchestrators run never holds it. The CLI talks to
+  the daemon with `~\.rsa\dispatch\client.key`, which only unlocks the policy-limited dispatch
+  API. Browsers (`Origin`), foreign `Host` headers, and requests without the key are refused.
+- **Docker workers** never receive it, because it never leaves Windows. Sandboxes cannot connect
+  to this PC on any of its addresses (LAN, Tailscale, Hyper-V/WSL), so they cannot reach T3 either.
+- **Integrity:** `policy.json` and `jobs.json` are signed with a key from the vault. If either was
+  edited, it is rejected: an edited policy denies everything until you approve a change, and an
+  edited job registry is set aside.
+
+Limitations (read before relying on it):
+
+- **Same Windows account.** Orchestrator agents run as your user. DPAPI keeps the vault from other
+  accounts and offline copies. It does not stop a process of your own account that deliberately
+  decrypts it. The same is true of re-signing the policy, or clicking the dialog with UI
+  automation. Such a process could equally mint T3 credentials with T3's own CLI. The dispatcher
+  does not widen what an agent can do *outside* the `rsa dispatch` interface: that remains
+  governed by the agent's own mode. If you pre-approve `rsa dispatch` for your agents (see
+  [Daily use](#daily-use)), do not also pre-approve arbitrary scripts or reading `~\.rsa\dispatch`.
+- **Shared sandbox container.** Dispatched jobs run in the same `rsa-oc-<instance>` container as
+  each other and as your interactive `opencode_linux` threads. A Full Access worker can read and
+  change other workspaces in that container. It can also read the sandbox server's password and
+  your provider API keys, and so drive other sessions there. Changes it makes in another workspace
+  reach that checkout only through the normal write-back, and show up in that thread's diff. Keep
+  secrets out of profiled repositories, use low-limit API keys, and keep `max_concurrent` small.
+- **Resources** (CPU, memory, PIDs) are limited per container, and every job in it shares them. The
+  dispatcher limits the number of jobs and their duration, not CPU per job.
+- **The bridge port** (127.0.0.1:47960) is itself an unauthenticated local entry to the sandbox
+  server unless `bridge_password` is set. The dispatcher does not change that.
+- Windows only (DPAPI, native dialog). No refresh tokens: re-authorize every 30 days.
+
+### Verified
+
+Exercised on 2026-10-22 against T3 Code 0.1.2 (outside-agent MCP), the live bridge, and the sandbox:
+
+- `tests/dispatch_test.py` (offline, 58/58). It uses a fake T3 that speaks OAuth and MCP (JSON
+  and SSE replies), runs the real dispatcher, and calls the CLI as a subprocess. Covered: sign-in;
+  a lower T3 ceiling refusing Full Access; default deny; dialog approve/deny; host providers and
+  non-projects refused; launch arguments; idempotency; concurrency, model, follow-up, and runtime
+  limits; `--ask`; cancel; ownership; lost launch replies; foreign-provider threads; T3 down and
+  restarted; dispatcher restarts; tampered policy and job files; expiry; and no token in any
+  output or file.
+- `tests/dispatch_live_test.py` (live, 30/30), run by a Claude orchestrator in **Auto** mode after
+  the user authorized the dispatcher in T3 and approved a profile in the dialog. The checks:
+  - Out-of-profile requests were refused, and nothing started.
+  - Full Access worker threads appeared in T3 (`creationSource: mcp`, `opencode_linux`,
+    `full-access`, their own worktree).
+  - The worker ran shell commands with no approvals (`uname -s` → `Linux`, `id -u` → `0`), and
+    its file synced back into the worktree only.
+  - A follow-up ran in the same thread, across a dispatcher restart.
+  - `cancel` interrupted a running `sleep 600`. The command never completed, and the job refused
+    further messages.
+  - The sandbox could not reach T3 on any of this PC's addresses (with a working internet control),
+    and its environment holds no T3 variables.
+- The Auto orchestrator's own `t3_thread_send` to a dispatched thread was refused by T3
+  (`runtime_mode_escalation_denied`). The orchestrator's thread stayed in Auto.
+- A **Codex** child in Auto mode (`gpt-6.1-sol`) ran `rsa dispatch profiles` without any sandbox
+  or approval prompt. Its out-of-profile `submit` was refused (`code: denied`), and Codex's
+  PowerShell wrapper reported that as exit 1.
+- Not exercised live: `--ask` one-off approvals with a real click (only the profile dialog was
+  clicked live; the dialog's timeout was tested, and the offline test covers both answers); a T3
+  restart while a job runs (the offline test covers losing the MCP session); and token expiry
+  against the real T3.
+- The native dialog appears as a visible top-level window, and its timeout counts as a denial.
+
 ## Daily use
 
 ```powershell
@@ -232,6 +418,9 @@ will ask for approval the first time, exactly as for any other networked command
 it, add a rule in your own settings: in Claude Code, `"permissions": {"allow": ["Bash(rsa:*)",
 "PowerShell(rsa:*)"]}`; in Codex, a `prefix_rule(pattern=["rsa"], decision="allow")` rule in
 `~/.codex/rules/`. This is optional and left to you, because it changes your approval boundary.
+A narrower choice for unattended T3 workers is to allow only `rsa dispatch` (e.g. `Bash(rsa dispatch:*)`,
+`pattern=["rsa", "dispatch"]`). Its commands enforce your profiles themselves, and its
+policy-widening commands still need your click in the dialog.
 
 ## Administration
 
@@ -338,6 +527,12 @@ Residual risks you should know about:
 | sandbox thread turn fails to start | `rsa bridge logs` (look for `bridge error` / `workspace preparation failed`) |
 | agent's changes missing from the checkout | `rsa bridge status` shows `conflicts` (your local edits won) or `last_error`; the agent's version is in `refs/rsa/ws/<key>` |
 | new API key not picked up by T3 threads | `rsa bridge restart --remote` |
+| `rsa dispatch` exit 4 (denied) | the listed violations say why; `rsa dispatch profiles` / `status`. Widen the profile yourself (`rsa dispatch profile add`, confirm the dialog) |
+| `rsa dispatch is not running` | `rsa dispatch start` (and `rsa dispatch autostart on`); `rsa dispatch logs` |
+| dispatcher not authorized / expired / `t3_mismatch` | `rsa dispatch authorize` (choose Full access); T3 must be running |
+| `POLICY REJECTED` in `rsa dispatch status` | `policy.json` was edited outside rsa dispatch; re-add your profiles with `rsa dispatch profile add` (each asks for confirmation) |
+| `cannot read ...vault.bin` | the vault is damaged or from another account: delete `~\.rsa\dispatch\vault.bin`, then `rsa dispatch restart`, `authorize`, and re-add profiles |
+| no dialog appeared for a profile change | the dispatcher must run in your desktop session: `rsa dispatch restart` from your own terminal, or use autostart |
 | want a clean slate | `rsa server stop`, then on the server `rm -rf ~/.rsa/tasks/* ~/.rsa/queue/*`, then `rsa server start` |
 
 ## Reverse engineering tools
@@ -439,8 +634,9 @@ rm -rf ~/.rsa
 ```
 ```powershell
 # on Windows
+rsa dispatch deauthorize; rsa dispatch stop; rsa dispatch autostart off   # then revoke it in T3 Settings > Connections
 rsa bridge stop; rsa bridge autostart off; rsa bridge t3-install --remove
-Remove-Item ~\.rsa\bridge -Recurse
+Remove-Item ~\.rsa\bridge, ~\.rsa\dispatch -Recurse
 Remove-Item ~\.local\bin\rsa, ~\.local\bin\rsa.cmd, ~\.claude\skills\remote-agents, ~\.codex\skills\remote-agents -Recurse
 git for-each-ref --format="%(refname)" refs/rsa/ | ForEach-Object { git update-ref -d $_ }   # per repo
 ```
@@ -451,6 +647,7 @@ git for-each-ref --format="%(refname)" refs/rsa/ | ForEach-Object { git update-r
 AGENTS.md                     guidance for coding agents working on this repo
 client/rsa.py                 Windows/any-OS client (stdlib Python)
 client/rsa_bridge.py          T3 bridge: local OpenCode-compatible endpoint, path mapping, file sync
+client/rsa_dispatch.py        Full Access dispatch: T3 outside-agent MCP client, profiles, local API, CLI
 server/rsa-server             server CLI + worker (stdlib Python)
 server/rsa-worker.service     systemd user unit
 server/sandbox/Dockerfile     sandbox image
@@ -463,4 +660,6 @@ server/sandbox/rsa-ws         workspace operations run inside the bridge server 
 skill/remote-agents/SKILL.md  instructions for Claude Code / Codex orchestrators
 tests/e2e.py                  end-to-end test of the headless queue against the live server
 tests/bridge_api_test.py      end-to-end test of the bridge (full-access emulation, isolation, sync)
+tests/dispatch_test.py        offline test of rsa dispatch against a fake T3 (policy, sign-in, integrity, recovery)
+tests/dispatch_live_test.py   live test of rsa dispatch (real T3, bridge and sandbox; needs authorization + a profile)
 ```
